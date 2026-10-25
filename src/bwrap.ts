@@ -9,6 +9,7 @@ export interface BwrapOptions {
   config: SandboxConfig;
   unshareNet?: boolean;
   socketDir?: string;
+  bridgeScriptPath?: string;
   proxyPort?: number;
   socksPort?: number;
   tmpfsBytes?: number; // Cap tmpfs in RAM (default: 512MB)
@@ -146,7 +147,7 @@ export const SAFE_ENV_VARS = [
  * Builds the bubblewrap CLI arguments implementing OS-level kernel isolation.
  */
 export function buildBwrapArgs(options: BwrapOptions): string[] {
-  const { cwd, config, unshareNet, socketDir, tmpfsBytes = 536870912 } = options; // Default 512MB RAM cap
+  const { cwd, config, unshareNet, socketDir, bridgeScriptPath, tmpfsBytes = 536870912 } = options; // Default 512MB RAM cap
   const args: string[] = [];
 
   // 1. Process & Terminal Isolation (Defeats TIOCSTI keystroke injection & setsid orphans)
@@ -253,14 +254,18 @@ export function buildBwrapArgs(options: BwrapOptions): string[] {
   }
   args.push("--setenv", "HOME", homedir());
 
-  // 12. Network namespace containment
+  // 12. Network namespace containment & Unix domain socket mount
   const networkSandboxed = unshareNet ?? config.network?.enabled !== false;
   if (networkSandboxed) {
     args.push("--unshare-net");
 
-    // Bind local socket directory if specified
+    // Bind local socket directory into /run/pi-sandbox AFTER --tmpfs /run
     if (socketDir && existsSync(socketDir)) {
       args.push("--bind", socketDir, "/run/pi-sandbox");
+    }
+
+    if (bridgeScriptPath && existsSync(bridgeScriptPath)) {
+      args.push("--ro-bind", bridgeScriptPath, "/run/pi-sandbox/bridge.py");
     }
   }
 
