@@ -3,6 +3,25 @@ import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path
 import { expandTilde, MANDATORY_INVARIANTS } from "./config.ts";
 
 /**
+ * In-memory cache for canonicalized pattern strings to eliminate repeated
+ * disk I/O and realpathSync calls in hot evaluation loops.
+ */
+const canonicalPatternCache = new Map<string, string>();
+
+/**
+ * In-memory cache for compiled glob regular expressions.
+ */
+const globRegexCache = new Map<string, RegExp>();
+
+/**
+ * Clears the pattern and glob caches (useful for testing or config reloads).
+ */
+export function clearPatternCache(): void {
+  canonicalPatternCache.clear();
+  globRegexCache.clear();
+}
+
+/**
  * Checks if targetPath is strictly inside allowedRoot or is allowedRoot itself.
  * Uses path.relative() rather than fragile string-prefix checks to prevent
  * sibling directory confusion (e.g. /app/project-secret matching /app/project).
@@ -32,9 +51,9 @@ export function isPathContained(allowedRoot: string, targetPath: string): boolea
  * - For files that do not exist yet (e.g. pending write operations), this function
  *   traverses upward to locate the nearest existing ancestor, resolves its realpath,
  *   and appends remaining non-existent components, defeating directory traversal (`../../`).
- *
- * Note: While canonicalizePath defeats static symlink escapes, Phase 3 (bwrap kernel mounts)
- * provides the ultimate protection against concurrent TOCTOU symlink races.
+ * - Fail-Closed: If canonicalization encounters an unexpected filesystem error (such as
+ *   ELOOP symlink loop or EACCES permission denied), it throws a SecurityError rather
+ *   than silently falling back to the raw string.
  *
  * @param filePath Path to resolve and canonicalize.
  * @param baseCwd Working directory to resolve relative paths against.
@@ -46,7 +65,15 @@ export function canonicalizePath(filePath: string, baseCwd: string = process.cwd
 
   try {
     return realpathSync.native(absolutePath);
-  } catch {
+  } catch (err: unknown) {
+    const error = err as NodeJS.ErrnoException;
+    // Only ENOENT (file does not exist yet) is permitted to traverse upward
+    if (error && error.code !== "ENOENT") {
+      throw new Error(
+        `[Security Sandbox] Failed to safely resolve path '${filePath}': ${error.code || error.message}`,
+      );
+    }
+
     // If the path does not exist, probe upwards to resolve symlinked parent directories
     const tail: string[] = [];
     let probe = absolutePath;
@@ -61,8 +88,11 @@ export function canonicalizePath(filePath: string, baseCwd: string = process.cwd
 
     try {
       return resolve(realpathSync.native(probe), ...tail);
-    } catch {
-      return absolutePath;
+    } catch (innerErr: unknown) {
+      const inner = innerErr as NodeJS.ErrnoException;
+      throw new Error(
+        `[Security Sandbox] Failed to resolve parent path '${probe}': ${inner.code || inner.message}`,
+      );
     }
   }
 }
@@ -71,26 +101,31 @@ export function canonicalizePath(filePath: string, baseCwd: string = process.cwd
  * Converts a standard file glob pattern into a strict regular expression.
  *
  * Glob Semantics Enforced:
- * - `*` matches any characters EXCEPT directory separator (`/`).
- * - `**` matches any characters INCLUDING directory separator (`/`).
- * - `?` matches a single character except `/`.
- * - All other regex meta-characters are escaped.
+ * - Supports both Unix ('/') and Windows ('\') path separators.
+ * - `*` matches any characters EXCEPT directory separators.
+ * - `**` matches any characters INCLUDING directory separators.
+ * - `?` matches a single character except directory separators.
+ * - Caches compiled RegExps to prevent redundant parsing and ReDoS.
  *
  * @param glob Pattern string.
  * @returns RegExp with strict path semantics.
  */
 export function globToRegex(glob: string): RegExp {
+  const normalizedGlob = glob.replace(/\\/g, "/");
+  const cached = globRegexCache.get(normalizedGlob);
+  if (cached) return cached;
+
   let regexStr = "";
   let i = 0;
 
-  while (i < glob.length) {
-    const char = glob[i];
+  while (i < normalizedGlob.length) {
+    const char = normalizedGlob[i];
 
     if (char === "*") {
-      if (glob[i + 1] === "*") {
+      if (normalizedGlob[i + 1] === "*") {
         // Recursive wildcard: '**'
-        if (glob[i + 2] === "/") {
-          regexStr += "(?:.*\\/)?";
+        if (normalizedGlob[i + 2] === "/") {
+          regexStr += "(?:.*[/\\\\])?";
           i += 3;
         } else {
           regexStr += ".*";
@@ -98,11 +133,14 @@ export function globToRegex(glob: string): RegExp {
         }
       } else {
         // Single component wildcard: '*'
-        regexStr += "[^/]*";
+        regexStr += "[^/\\\\]*";
         i++;
       }
     } else if (char === "?") {
-      regexStr += "[^/]";
+      regexStr += "[^/\\\\]";
+      i++;
+    } else if (char === "/" || char === "\\") {
+      regexStr += "[/\\\\]";
       i++;
     } else if (
       char === "." ||
@@ -115,8 +153,7 @@ export function globToRegex(glob: string): RegExp {
       char === "]" ||
       char === "{" ||
       char === "}" ||
-      char === "|" ||
-      char === "\\"
+      char === "|"
     ) {
       regexStr += "\\" + char;
       i++;
@@ -126,7 +163,22 @@ export function globToRegex(glob: string): RegExp {
     }
   }
 
-  return new RegExp(`^${regexStr}$`);
+  const compiled = new RegExp(`^${regexStr}$`);
+  globRegexCache.set(normalizedGlob, compiled);
+  return compiled;
+}
+
+/**
+ * Memoized helper to get the canonical path of a pattern string.
+ */
+function getCachedCanonicalPattern(rawPattern: string, baseCwd: string): string {
+  const cacheKey = `${baseCwd}::${rawPattern}`;
+  let canonical = canonicalPatternCache.get(cacheKey);
+  if (!canonical) {
+    canonical = canonicalizePath(rawPattern, baseCwd);
+    canonicalPatternCache.set(cacheKey, canonical);
+  }
+  return canonical;
 }
 
 /**
@@ -149,7 +201,13 @@ export function matchesPattern(
 ): boolean {
   if (!patterns || patterns.length === 0) return false;
 
-  const targetCanonical = canonicalizePath(filePath, baseCwd);
+  let targetCanonical: string;
+  try {
+    targetCanonical = canonicalizePath(filePath, baseCwd);
+  } catch {
+    // If target path failed canonicalization due to ELOOP/EACCES, treat as matching deny patterns (fail-closed)
+    return true;
+  }
   const targetBaseName = basename(targetCanonical);
 
   for (const rawPattern of patterns) {
@@ -164,7 +222,7 @@ export function matchesPattern(
       continue;
     }
 
-    // 2. Path-based glob check (contains '*' and '/')
+    // 2. Path-based glob check (contains '*' and a separator)
     if (rawPattern.includes("*")) {
       const expandedPattern = expandTilde(rawPattern);
       const absPattern = isAbsolute(expandedPattern)
@@ -178,8 +236,14 @@ export function matchesPattern(
       continue;
     }
 
-    // 3. Exact path or directory containment check (using isPathContained)
-    const patternCanonical = canonicalizePath(rawPattern, baseCwd);
+    // 3. Exact path or directory containment check (memoized pattern resolution)
+    let patternCanonical: string;
+    try {
+      patternCanonical = getCachedCanonicalPattern(rawPattern, baseCwd);
+    } catch {
+      continue;
+    }
+
     if (targetCanonical === patternCanonical) {
       return true;
     }
@@ -229,7 +293,7 @@ export type FilePolicyDecision = "allow" | "deny" | "prompt";
  * Decides whether a file READ operation should be allowed, denied, or prompted.
  *
  * Rules:
- * 1. Deny if in denyRead or matches isSecretPath.
+ * 1. Deny precedence: If in denyRead or matches isSecretPath, it is DENIED.
  * 2. Allow if in explicit allowRead.
  * 3. Allow if inside working directory (cwd) or /tmp.
  * 4. General system reads allowed unless matching denyRead.
@@ -246,7 +310,7 @@ export function decideReadPolicy(
   denyRead: readonly string[] | string[] = [],
   baseCwd: string = process.cwd(),
 ): FilePolicyDecision {
-  // 1. Explicit deny or secret check
+  // 1. Explicit deny or secret check (Deny Precedence)
   if (matchesPattern(filePath, denyRead, baseCwd) || isSecretPath(filePath, denyRead, baseCwd)) {
     return "deny";
   }
@@ -257,7 +321,12 @@ export function decideReadPolicy(
   }
 
   // 3. Current working directory is always allowed to read
-  const canonicalTarget = canonicalizePath(filePath, baseCwd);
+  let canonicalTarget: string;
+  try {
+    canonicalTarget = canonicalizePath(filePath, baseCwd);
+  } catch {
+    return "deny"; // Fail-closed on resolution errors
+  }
   const canonicalCwd = canonicalizePath(baseCwd, baseCwd);
   if (isPathContained(canonicalCwd, canonicalTarget)) {
     return "allow";
@@ -276,7 +345,7 @@ export function decideReadPolicy(
  * Decides whether a file WRITE or EDIT operation should be allowed, denied, or prompted.
  *
  * Rules:
- * 1. Deny if in denyWrite or matches isSecretPath (e.g. .env, *.key, .pi/sandbox.json).
+ * 1. Deny precedence: If in denyWrite or matches isSecretPath, it is DENIED.
  * 2. Allow if within allowWrite boundaries (default: ['.', '/tmp'] or custom paths).
  * 3. Prompt if writing outside allowed boundaries (e.g. /etc/, ~/.bashrc, sibling projects).
  *
@@ -292,7 +361,7 @@ export function decideWritePolicy(
   denyWrite: readonly string[] | string[] = [],
   baseCwd: string = process.cwd(),
 ): FilePolicyDecision {
-  // 1. Explicit deny or secret pattern check (mandatory invariants take precedence)
+  // 1. Explicit deny or secret pattern check (Deny Precedence)
   if (matchesPattern(filePath, denyWrite, baseCwd) || isSecretPath(filePath, denyWrite, baseCwd)) {
     return "deny";
   }

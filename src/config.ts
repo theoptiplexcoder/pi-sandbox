@@ -28,6 +28,7 @@ export interface NetworkConfig {
 export interface FilesystemConfig {
   /**
    * Paths explicitly allowed for reading beyond the project root and /tmp.
+   * Note: Only configurable at global user level. Project configs cannot grant allowRead.
    */
   allowRead?: string[];
   /**
@@ -37,7 +38,7 @@ export interface FilesystemConfig {
   denyRead?: string[];
   /**
    * Paths allowed for writing (default: [".", "/tmp"]).
-   * Can include absolute paths (e.g. "/var/log/my-app").
+   * Note: Only configurable at global user level. Project configs cannot grant allowWrite.
    */
   allowWrite?: string[];
   /**
@@ -236,11 +237,12 @@ export function mergeGlobalConfig(
 /**
  * Merges untrusted project-local configuration with strict trust boundaries:
  *
- * Security Invariants Enforced:
+ * Security Invariants Enforced (Linus Rule: Zero Trust on Project Permissions):
  * 1. Project config CANNOT disable the sandbox (`enabled: false` is rejected).
  * 2. Project config CANNOT disable network isolation.
  * 3. Project config CANNOT remove mandatory deny rules (deny lists can only be expanded).
- * 4. Project config CANNOT grant allowRead or allowWrite to mandatory protected secrets.
+ * 4. Project config CANNOT grant allowRead or allowWrite permissions (project allow* is completely dropped).
+ *    Untrusted repositories cannot authorize themselves to read or write host files.
  */
 export function mergeProjectConfig(
   trustedBase: SandboxConfig,
@@ -261,7 +263,7 @@ export function mergeProjectConfig(
     projectOverrides.network?.deniedDomains,
   ]);
 
-  // Project can request additional deny rules (tightening the policy)
+  // Project can request additional deny rules (tightening the policy only)
   const effectiveDenyRead = uniqueArray([
     MANDATORY_INVARIANTS.denyRead,
     trustedBase.filesystem?.denyRead,
@@ -274,35 +276,8 @@ export function mergeProjectConfig(
     projectOverrides.filesystem?.denyWrite,
   ]);
 
-  // Project allowWrite / allowRead: filter out any attempt to whitelist mandatory secrets
-  const filterOutSecrets = (paths: string[] | undefined): string[] => {
-    if (!paths) return [];
-    return paths.filter((p) => {
-      const clean = p.trim();
-      return (
-        clean !== "~/.ssh" &&
-        !clean.startsWith("~/.ssh") &&
-        clean !== "~/.aws" &&
-        !clean.startsWith("~/.aws") &&
-        clean !== "/etc/shadow" &&
-        clean !== "/etc" &&
-        !clean.startsWith("/etc/") &&
-        clean !== ".env" &&
-        !clean.includes(".pi/sandbox.json")
-      );
-    });
-  };
-
-  const effectiveAllowRead = uniqueArray([
-    trustedBase.filesystem?.allowRead,
-    filterOutSecrets(projectOverrides.filesystem?.allowRead),
-  ]);
-
-  const effectiveAllowWrite = uniqueArray([
-    trustedBase.filesystem?.allowWrite,
-    filterOutSecrets(projectOverrides.filesystem?.allowWrite),
-  ]);
-
+  // Security Hardening: Project-local allowRead and allowWrite are completely ignored.
+  // Only trustedBase (system defaults + user's ~/.pi/agent/sandbox.json) defines writable/readable roots.
   return {
     enabled: effectiveEnabled,
     network: {
@@ -311,9 +286,9 @@ export function mergeProjectConfig(
       deniedDomains: effectiveDeniedDomains,
     },
     filesystem: {
-      allowRead: effectiveAllowRead,
+      allowRead: trustedBase.filesystem?.allowRead ?? [],
       denyRead: effectiveDenyRead,
-      allowWrite: effectiveAllowWrite,
+      allowWrite: trustedBase.filesystem?.allowWrite ?? [".", "/tmp"],
       denyWrite: effectiveDenyWrite,
     },
   };

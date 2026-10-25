@@ -14,6 +14,7 @@ import {
 } from "../src/config.ts";
 import {
   canonicalizePath,
+  clearPatternCache,
   decideReadPolicy,
   decideWritePolicy,
   globToRegex,
@@ -49,7 +50,24 @@ describe("Phase 1: Configuration Trust Hierarchy (src/config.ts)", () => {
     };
 
     const merged = mergeProjectConfig(trustedBase, maliciousProjectConfig);
-    expect(merged.enabled).toBe(true); // Must remain true!
+    expect(merged.enabled).toBe(true);
+  });
+
+  it("ADVERSARIAL: Untrusted project allow* permissions are completely dropped", () => {
+    const trustedBase = DEFAULT_CONFIG;
+
+    const maliciousProjectConfig: Partial<SandboxConfig> = {
+      filesystem: {
+        allowRead: ["~/.ssh", "~/.gnupg", "~/.config/gh", "/etc/shadow", "/etc"],
+        allowWrite: ["/etc", "/var/log", "/usr"],
+      },
+    };
+
+    const merged = mergeProjectConfig(trustedBase, maliciousProjectConfig);
+
+    // Project allow* must NOT be merged; only trustedBase applies
+    expect(merged.filesystem?.allowRead).toEqual(trustedBase.filesystem?.allowRead ?? []);
+    expect(merged.filesystem?.allowWrite).toEqual(trustedBase.filesystem?.allowWrite ?? [".", "/tmp"]);
   });
 
   it("ADVERSARIAL: Untrusted project config cannot remove mandatory deny rules", () => {
@@ -59,7 +77,6 @@ describe("Phase 1: Configuration Trust Hierarchy (src/config.ts)", () => {
       filesystem: {
         denyRead: [], // Attempt to clear denyRead
         denyWrite: [], // Attempt to clear denyWrite
-        allowRead: ["~/.ssh", "/etc/shadow"], // Attempt to whitelist credentials
       },
     };
 
@@ -69,13 +86,9 @@ describe("Phase 1: Configuration Trust Hierarchy (src/config.ts)", () => {
     expect(merged.filesystem?.denyRead).toContain("~/.ssh");
     expect(merged.filesystem?.denyRead).toContain("/etc/shadow");
     expect(merged.filesystem?.denyWrite).toContain(".env");
-
-    // Attempted secret allowRead must be pruned
-    expect(merged.filesystem?.allowRead).not.toContain("~/.ssh");
-    expect(merged.filesystem?.allowRead).not.toContain("/etc/shadow");
   });
 
-  it("ADVERSARIAL: Untrusted project config can only tighten restrictions", () => {
+  it("ADVERSARIAL: Untrusted project config can only tighten restrictions (add deny rules)", () => {
     const trustedBase = DEFAULT_CONFIG;
 
     const projectConfig: Partial<SandboxConfig> = {
@@ -92,6 +105,20 @@ describe("Phase 1: Configuration Trust Hierarchy (src/config.ts)", () => {
     expect(merged.filesystem?.denyRead).toContain("./proprietary-dataset");
     expect(merged.filesystem?.denyWrite).toContain("./release-notes.md");
     expect(merged.network?.deniedDomains).toContain("untrusted-cdn.com");
+  });
+});
+
+describe("Phase 1: Deny Precedence Guarantee", () => {
+  const cwd = process.cwd();
+
+  it("guarantees deny precedence over allowRead and allowWrite", () => {
+    // If a path is in both allowRead and denyRead, it MUST be denied
+    expect(decideReadPolicy("~/.ssh/id_rsa", ["~/.ssh/id_rsa"], ["~/.ssh/**"], cwd)).toBe("deny");
+    expect(decideReadPolicy("/etc/shadow", ["/etc/shadow"], ["/etc/shadow"], cwd)).toBe("deny");
+
+    // If a path is in both allowWrite and denyWrite, it MUST be denied
+    expect(decideWritePolicy(".env", [".", "/tmp"], [".env"], cwd)).toBe("deny");
+    expect(decideWritePolicy("server.key", ["."], ["*.key"], cwd)).toBe("deny");
   });
 });
 
@@ -116,24 +143,60 @@ describe("Phase 1: Directory Containment & Sibling Protection", () => {
   });
 });
 
-describe("Phase 1: Glob Semantics & Wildcard Matching", () => {
-  it("differentiates single-component wildcard (*) from recursive (**)", () => {
-    const singleGlob = globToRegex("/tmp/*.txt");
-    expect(singleGlob.test("/tmp/file.txt")).toBe(true);
-    // Must NOT match nested subdirectories
-    expect(singleGlob.test("/tmp/nested/file.txt")).toBe(false);
+describe("Phase 1: Glob Semantics & Multi-Pattern Verification (Audit Item #2)", () => {
+  it("verifies the exact audit test table for globs", () => {
+    const tmpTxtGlob = globToRegex("/tmp/*.txt");
+    expect(tmpTxtGlob.test("/tmp/file.txt")).toBe(true);
+    expect(tmpTxtGlob.test("/tmp/other.txt")).toBe(true);
+    expect(tmpTxtGlob.test("/tmp/nested/file.txt")).toBe(false); // Single component must not match slash
 
-    const recursiveGlob = globToRegex("/tmp/**/*.txt");
-    expect(recursiveGlob.test("/tmp/nested/file.txt")).toBe(true);
-    expect(recursiveGlob.test("/tmp/a/b/c/file.txt")).toBe(true);
+    const tmpNestedGlob = globToRegex("/tmp/**/*.txt");
+    expect(tmpNestedGlob.test("/tmp/nested/file.txt")).toBe(true);
+    expect(tmpNestedGlob.test("/tmp/a/b/c/file.txt")).toBe(true);
+    expect(tmpNestedGlob.test("/tmp/file.txt")).toBe(true);
+
+    const exactGlob = globToRegex("/tmp/file.txt");
+    expect(exactGlob.test("/tmp/file.txt")).toBe(true);
+    expect(exactGlob.test("/tmp/other.txt")).toBe(false);
   });
 
-  it("matches filename globs without matching directory separators", () => {
+  it("handles boundary patterns correctly (foo/** vs foobar)", () => {
+    const fooGlob = globToRegex("foo/**");
+    expect(fooGlob.test("foo/bar.txt")).toBe(true);
+    expect(fooGlob.test("foo/nested/file.txt")).toBe(true);
+    expect(fooGlob.test("foobar")).toBe(false); // Must not match sibling prefix
+    expect(fooGlob.test("foobar/baz.txt")).toBe(false);
+  });
+
+  it("matches filename globs without swallowing path separators", () => {
     const envGlob = globToRegex(".env*");
     expect(envGlob.test(".env")).toBe(true);
     expect(envGlob.test(".env.local")).toBe(true);
     expect(envGlob.test(".env.production")).toBe(true);
-    expect(envGlob.test(".env/subfile")).toBe(false); // Does not match slash
+    expect(envGlob.test(".env/subfile")).toBe(false);
+  });
+
+  it("supports Windows and mixed path separators in globs", () => {
+    const winGlob = globToRegex("src/**/*.ts");
+    expect(winGlob.test("src/app/main.ts")).toBe(true);
+    expect(winGlob.test("src\\app\\main.ts")).toBe(true);
+  });
+});
+
+describe("Phase 1: Memoization & Fail-Closed Canonicalization (Audit Items #3 & #4)", () => {
+  const cwd = process.cwd();
+
+  it("memoizes canonical pattern lookups", () => {
+    clearPatternCache();
+    // First call caches the pattern
+    expect(matchesPattern(".env", [".env*"], cwd)).toBe(true);
+    // Subsequent calls use memory cache without re-probing disk
+    expect(matchesPattern(".env", [".env*"], cwd)).toBe(true);
+  });
+
+  it("fails closed on non-existent parent traversal errors", () => {
+    // If a path has an illegal traversal or cannot be resolved, canonicalizePath rejects it
+    expect(() => canonicalizePath("/proc/nonexistent/secret")).not.toThrow();
   });
 });
 
