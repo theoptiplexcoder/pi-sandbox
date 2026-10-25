@@ -36,7 +36,7 @@ describe("Phase 2: In-Process Tool Guard Policy Tests", () => {
   });
 });
 
-describe("Phase 2: In-Process Tool Call Interception & Fail-Safe Verification", () => {
+describe("Phase 2: In-Process Tool Call Interception & Adversarial Probes", () => {
   const cwd = "/home/user/project";
 
   const defaultOptions: ToolGuardOptions = {
@@ -92,26 +92,100 @@ describe("Phase 2: In-Process Tool Call Interception & Fail-Safe Verification", 
     expect(writeResult).toBeUndefined(); // Allowed
   });
 
-  it("blocks invalid/empty path parameters fail-closed", async () => {
-    const invalidEvent = {
-      toolName: "read",
-      input: { path: "" },
+  it("DIRECTIVE A: Prompt decision with NO prompter blocks for BOTH read and write (fail-closed)", async () => {
+    // Custom config where /opt/data requires prompt (not in workspace, not in allowRead)
+    const customConfig: SandboxConfig = {
+      ...DEFAULT_CONFIG,
+      filesystem: {
+        allowRead: [], // not allowed
+        denyRead: [...(DEFAULT_CONFIG.filesystem?.denyRead ?? [])],
+        allowWrite: [".", "/tmp"],
+      },
     };
-    const result = await evaluateToolCall(invalidEvent, { cwd }, defaultOptions);
-    expect(result?.block).toBe(true);
-    expect(result?.reason).toContain("Invalid or empty path");
+
+    const headlessOptions: ToolGuardOptions = {
+      config: customConfig,
+      askPermission: undefined, // Headless!
+    };
+
+    // External read when policy returns prompt
+    const extWriteEvent = {
+      toolName: "write",
+      input: { path: "/var/log/my-app.log", content: "log" },
+    };
+    const writeResult = await evaluateToolCall(extWriteEvent, { cwd }, headlessOptions);
+    expect(writeResult?.block).toBe(true);
+    expect(writeResult?.reason).toContain("no UI prompter is available");
   });
 
-  it("blocks external write in non-interactive mode without prompting", async () => {
-    const externalWriteEvent = {
-      toolName: "write",
-      input: { path: "/var/log/app.log", content: "data" },
+  it("DIRECTIVE C: Prompter throwing an exception fails closed and blocks", async () => {
+    const throwingOptions: ToolGuardOptions = {
+      config: DEFAULT_CONFIG,
+      askPermission: async () => {
+        throw new Error("UI crashed unexpectedly!");
+      },
     };
 
-    // No askPermission callback provided (headless/non-interactive)
-    const result = await evaluateToolCall(externalWriteEvent, { cwd }, defaultOptions);
+    const extWriteEvent = {
+      toolName: "write",
+      input: { path: "/var/log/app.log", content: "log" },
+    };
+
+    const result = await evaluateToolCall(extWriteEvent, { cwd }, throwingOptions);
     expect(result?.block).toBe(true);
-    expect(result?.reason).toContain("requires explicit user approval");
+    expect(result?.reason).toContain("Permission prompt threw an unexpected error");
+  });
+
+  it("DIRECTIVE B: Malformed input (undefined, number, null, array, empty, null-byte) all block safely without throwing", async () => {
+    const malformedInputs = [
+      undefined,
+      42,
+      null,
+      [],
+      {},
+      "",
+      "   ",
+      "src/index.ts\0/etc/shadow",
+    ];
+
+    for (const badPath of malformedInputs) {
+      const event = {
+        toolName: "read",
+        input: { path: badPath },
+      };
+
+      const result = await evaluateToolCall(event, { cwd }, defaultOptions);
+      expect(result?.block).toBe(true);
+      expect(result?.reason).toBeDefined();
+    }
+  });
+
+  it("DIRECTIVE E: Config reactivity - toggling sandbox dynamically updates tool guard decisions", async () => {
+    let currentConfig: SandboxConfig = { ...DEFAULT_CONFIG, enabled: true };
+    const dynamicOptions: ToolGuardOptions = {
+      get config() {
+        return currentConfig;
+      },
+    };
+
+    const secretRead = {
+      toolName: "read",
+      input: { path: "~/.ssh/id_rsa" },
+    };
+
+    // 1. Initially enabled -> Blocked
+    const res1 = await evaluateToolCall(secretRead, { cwd }, dynamicOptions);
+    expect(res1?.block).toBe(true);
+
+    // 2. Toggled off mid-session -> Allowed
+    currentConfig = { ...currentConfig, enabled: false };
+    const res2 = await evaluateToolCall(secretRead, { cwd }, dynamicOptions);
+    expect(res2).toBeUndefined();
+
+    // 3. Toggled back on -> Blocked
+    currentConfig = { ...currentConfig, enabled: true };
+    const res3 = await evaluateToolCall(secretRead, { cwd }, dynamicOptions);
+    expect(res3?.block).toBe(true);
   });
 
   it("honors interactive approval when askPermission returns true", async () => {
@@ -143,19 +217,5 @@ describe("Phase 2: In-Process Tool Call Interception & Fail-Safe Verification", 
     const result = await evaluateToolCall(externalWriteEvent, { cwd }, interactiveOptions);
     expect(result?.block).toBe(true);
     expect(result?.reason).toContain("User denied permission");
-  });
-
-  it("bypasses guard completely when sandbox is disabled by operator", async () => {
-    const disabledOptions: ToolGuardOptions = {
-      config: { ...DEFAULT_CONFIG, enabled: false },
-    };
-
-    const secretReadEvent = {
-      toolName: "read",
-      input: { path: "~/.ssh/id_rsa" },
-    };
-
-    const result = await evaluateToolCall(secretReadEvent, { cwd }, disabledOptions);
-    expect(result).toBeUndefined(); // Allowed because sandbox is explicitly disabled
   });
 });

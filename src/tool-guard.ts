@@ -28,45 +28,107 @@ export interface ToolBlockResult {
 }
 
 /**
+ * Shared helper to resolve 'prompt' decisions fail-closed across all tool types.
+ */
+async function resolvePrompt(
+  operation: "read" | "write" | "edit",
+  targetPath: string,
+  askPermission?: (message: string, path: string) => Promise<boolean>,
+): Promise<ToolBlockResult | undefined> {
+  if (!askPermission) {
+    return {
+      block: true,
+      reason: `[Security Sandbox] ${operation.toUpperCase()} to path '${targetPath}' outside allowed boundaries requires explicit user approval, but no UI prompter is available.`,
+    };
+  }
+
+  try {
+    const approved = await askPermission(
+      `Agent is requesting to ${operation.toUpperCase()} path outside workspace: ${targetPath}`,
+      targetPath,
+    );
+    if (!approved) {
+      return {
+        block: true,
+        reason: `[Security Sandbox] User denied permission to ${operation} '${targetPath}'.`,
+      };
+    }
+    return undefined; // Approved
+  } catch (err: unknown) {
+    // Fail-Closed: If the UI prompt dialog throws or aborts, block the call
+    return {
+      block: true,
+      reason: `[Security Sandbox Error] Permission prompt threw an unexpected error: ${err instanceof Error ? err.message : String(err)}. Operation blocked.`,
+    };
+  }
+}
+
+/**
+ * Validates and sanitizes a path argument from an untrusted tool call.
+ * Rejects undefined, null, non-strings, empty strings, and null-bytes (\0).
+ */
+function validatePathInput(rawPath: unknown): { valid: true; path: string } | { valid: false; reason: string } {
+  if (typeof rawPath !== "string") {
+    return {
+      valid: false,
+      reason: `[Security Sandbox] Invalid path parameter: expected non-empty string, got ${typeof rawPath}.`,
+    };
+  }
+
+  const trimmed = rawPath.trim();
+  if (trimmed.length === 0) {
+    return {
+      valid: false,
+      reason: "[Security Sandbox] Invalid path parameter: path cannot be empty.",
+    };
+  }
+
+  if (trimmed.includes("\0")) {
+    return {
+      valid: false,
+      reason: "[Security Sandbox] Poison null-byte detected in path parameter.",
+    };
+  }
+
+  return { valid: true, path: trimmed };
+}
+
+/**
  * Evaluates an in-process tool call event and determines if it should be allowed or blocked.
- * This function is extracted to enable direct, deterministic testing without a live Pi harness.
+ * This is the exact logic executed inside pi.on("tool_call").
  *
  * Security Model:
- * - Fail-Closed: If an unhandled error occurs during path inspection or policy evaluation,
- *   the tool call is immediately blocked.
- * - Non-Interactive Safe: If askPermission is not provided and the policy returns 'prompt',
- *   the tool call is blocked immediately.
- * - Handles read, write, and edit built-in tools.
+ * - Fail-Closed: Any unhandled exception or failed check blocks the tool.
+ * - Non-interactive safe: If askPermission is missing, 'prompt' blocks.
+ * - Input sanitized: Null bytes, empty paths, and wrong types are rejected upfront.
  */
 export async function evaluateToolCall(
   event: unknown,
   ctx: { cwd: string },
   options: ToolGuardOptions,
 ): Promise<ToolBlockResult | undefined> {
-  const { config, askPermission } = options;
-
-  // If sandbox is explicitly disabled by operator, bypass guard
-  if (config.enabled === false) {
-    return undefined;
-  }
-
-  const baseCwd = ctx.cwd || process.cwd();
-  const allowRead = config.filesystem?.allowRead ?? [];
-  const denyRead = config.filesystem?.denyRead ?? [];
-  const allowWrite = config.filesystem?.allowWrite ?? [".", "/tmp"];
-  const denyWrite = config.filesystem?.denyWrite ?? [];
-
   try {
+    const { config, askPermission } = options;
+
+    // If sandbox is explicitly disabled by operator, bypass guard
+    if (config.enabled === false) {
+      return undefined;
+    }
+
+    const baseCwd = ctx.cwd || process.cwd();
+    const allowRead = config.filesystem?.allowRead ?? [];
+    const denyRead = config.filesystem?.denyRead ?? [];
+    const allowWrite = config.filesystem?.allowWrite ?? [".", "/tmp"];
+    const denyWrite = config.filesystem?.denyWrite ?? [];
+
     // 1. Guard READ tool
     if (isToolCallEventType("read", event as any)) {
-      const targetPath = (event as any).input?.path;
-      if (typeof targetPath !== "string" || !targetPath.trim()) {
-        return {
-          block: true,
-          reason: "[Security Sandbox] Invalid or empty path provided to 'read' tool.",
-        };
+      const pathValidation = validatePathInput((event as any).input?.path);
+      if (!pathValidation.valid) {
+        return { block: true, reason: pathValidation.reason };
       }
 
+      const targetPath = pathValidation.path;
       const decision = decideReadPolicy(targetPath, allowRead, denyRead, baseCwd);
 
       if (decision === "deny") {
@@ -77,36 +139,18 @@ export async function evaluateToolCall(
       }
 
       if (decision === "prompt") {
-        if (askPermission) {
-          const approved = await askPermission(
-            `Agent is requesting to READ external file: ${targetPath}`,
-            targetPath,
-          );
-          if (!approved) {
-            return {
-              block: true,
-              reason: `[Security Sandbox] User denied permission to read '${targetPath}'.`,
-            };
-          }
-        } else {
-          return {
-            block: true,
-            reason: `[Security Sandbox] Reading path '${targetPath}' outside allowed boundaries requires explicit user approval.`,
-          };
-        }
+        return await resolvePrompt("read", targetPath, askPermission);
       }
     }
 
     // 2. Guard WRITE tool
     if (isToolCallEventType("write", event as any)) {
-      const targetPath = (event as any).input?.path;
-      if (typeof targetPath !== "string" || !targetPath.trim()) {
-        return {
-          block: true,
-          reason: "[Security Sandbox] Invalid or empty path provided to 'write' tool.",
-        };
+      const pathValidation = validatePathInput((event as any).input?.path);
+      if (!pathValidation.valid) {
+        return { block: true, reason: pathValidation.reason };
       }
 
+      const targetPath = pathValidation.path;
       const decision = decideWritePolicy(targetPath, allowWrite, denyWrite, baseCwd);
 
       if (decision === "deny") {
@@ -117,36 +161,18 @@ export async function evaluateToolCall(
       }
 
       if (decision === "prompt") {
-        if (askPermission) {
-          const approved = await askPermission(
-            `Agent is requesting to WRITE to file outside workspace: ${targetPath}`,
-            targetPath,
-          );
-          if (!approved) {
-            return {
-              block: true,
-              reason: `[Security Sandbox] User denied permission to write to '${targetPath}'.`,
-            };
-          }
-        } else {
-          return {
-            block: true,
-            reason: `[Security Sandbox] Writing to path '${targetPath}' outside allowed write boundaries requires explicit user approval.`,
-          };
-        }
+        return await resolvePrompt("write", targetPath, askPermission);
       }
     }
 
     // 3. Guard EDIT tool
     if (isToolCallEventType("edit", event as any)) {
-      const targetPath = (event as any).input?.path;
-      if (typeof targetPath !== "string" || !targetPath.trim()) {
-        return {
-          block: true,
-          reason: "[Security Sandbox] Invalid or empty path provided to 'edit' tool.",
-        };
+      const pathValidation = validatePathInput((event as any).input?.path);
+      if (!pathValidation.valid) {
+        return { block: true, reason: pathValidation.reason };
       }
 
+      const targetPath = pathValidation.path;
       const decision = decideWritePolicy(targetPath, allowWrite, denyWrite, baseCwd);
 
       if (decision === "deny") {
@@ -157,32 +183,16 @@ export async function evaluateToolCall(
       }
 
       if (decision === "prompt") {
-        if (askPermission) {
-          const approved = await askPermission(
-            `Agent is requesting to EDIT file outside workspace: ${targetPath}`,
-            targetPath,
-          );
-          if (!approved) {
-            return {
-              block: true,
-              reason: `[Security Sandbox] User denied permission to edit '${targetPath}'.`,
-            };
-          }
-        } else {
-          return {
-            block: true,
-            reason: `[Security Sandbox] Editing path '${targetPath}' outside allowed write boundaries requires explicit user approval.`,
-          };
-        }
+        return await resolvePrompt("edit", targetPath, askPermission);
       }
     }
 
     return undefined; // Tool call permitted
   } catch (error: any) {
-    // Fail-Closed: If policy evaluation throws unexpectedly, block the call
+    // Fail-Closed: If any error throws, immediately block the tool call
     return {
       block: true,
-      reason: `[Security Sandbox Error] Failed to evaluate security policy safely: ${error?.message || error}. Operation blocked.`,
+      reason: `[Security Sandbox Error] Failed to evaluate security policy safely: ${error?.message || String(error)}. Operation blocked.`,
     };
   }
 }

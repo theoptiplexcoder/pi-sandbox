@@ -84,31 +84,42 @@ Establish the immutable security policies, hierarchical configuration parsing, s
 ### Objective
 Secure Pi's direct Node.js built-in tools (`read`, `write`, `edit`) from prompt injections and unauthorized data access. These tools execute inside the Node process, so OS-level process sandboxes cannot constrain them; they must be guarded at the event level.
 
+### Security Perimeter & Tool Boundaries (Directive D)
+- **Phase 2 Perimeter**: Strictly protects Pi's direct Node.js built-in filesystem tools (`read`, `write`, `edit`).
+- **Pi Built-in Context**: Pi only exposes `read`, `write`, `edit`, and `bash` as built-in coding agent tools. `grep`, `find`, and `ls` are not registered as standalone Node tools in Pi core; they run via the `bash` subprocess tool.
+- **Subprocess & External Perimeter**: Shell executions (`bash` tool and interactive `!` commands), subprocesses, network calls, and package managers are explicitly isolated at the operating system kernel level in **Phase 3 (bwrap)** and **Phase 4 (network proxy)**.
+
 ### Modules to Build & Refine
 1. **`src/tool-guard.ts`**:
    - `registerToolGuard(pi: ExtensionAPI, getOptions: () => ToolGuardOptions)`:
      - Subscribes to `pi.on("tool_call")`.
-     - Uses `isToolCallEventType("read", event)`, `isToolCallEventType("write", event)`, and `isToolCallEventType("edit", event)` for strictly-typed parameter handling.
-     - Enforces fail-safe error handling (any unhandled exception in the guard defaults to blocking the call).
+     - Validates and sanitizes parameters (rejects undefined, non-strings, empty paths, and null bytes `\0`).
+     - Uses a shared `resolvePrompt()` helper to enforce fail-closed behavior across all operations.
+     - Top-level `try/catch` wrapping: any unexpected exception in policy evaluation or prompter execution immediately returns `{ block: true, reason }`.
    - **Read Guard**:
      - Evaluates target path against `decideReadPolicy`.
      - If denied: returns `{ block: true, reason: "[Security Sandbox Violation] Reading '<path>' is denied by security policy." }`.
-     - If prompt: delegates to `askPermission` callback or blocks if non-interactive.
+     - If prompt: delegates to `resolvePrompt()`. If `askPermission` is undefined (headless/non-interactive), **fails closed to block**.
    - **Write / Edit Guard**:
      - Evaluates target path against `decideWritePolicy`.
      - Prevents unauthorized modification of host files outside `allowWrite` (e.g. `~/.bashrc`, `/etc/crontab`).
-     - Prevents tampering with sensitive files inside the workspace (e.g. `.env`).
+     - Prevents tampering with sensitive files inside the workspace (e.g. `.env`, `.pi/sandbox.json`).
+     - If prompt: delegates to `resolvePrompt()`. If headless/unapproved, **fails closed to block**.
 
 ### Developer Documentation Standards
 - Document how Pi's `event.input` mutability works vs blocking with `{ block: true, reason }`.
 - Document why `tool_call` errors block the tool fail-safe per Pi's security guidelines.
 
 ### Verification & Definition of Done (DoD)
-- Unit test suite: `test/tool-guard.test.ts`
+- Unit & adversarial test suite: `test/tool-guard.test.ts`
 - Tests must verify:
   - Reading `~/.ssh/id_rsa`, `/etc/shadow`, and `.env` returns `block: true`.
-  - Writing or editing `.env` or files outside workspace is blocked or prompted.
+  - Writing or editing `.env`, `.pi/sandbox.json`, or files outside workspace is blocked or prompted.
   - Writing valid files inside workspace (`src/main.ts`, `/tmp/temp.log`) is allowed.
+  - Directive A: Prompt decision with NO prompter blocks for both read and write (fail-closed).
+  - Directive B: Malformed input (undefined, 42, null, array, empty, null byte `\0`) all block safely without throwing.
+  - Directive C: Prompter throwing an exception fails closed and blocks.
+  - Directive E: Dynamic config reactivity (mid-session toggle updates guard decisions instantly).
 - Command: `bun test test/tool-guard.test.ts` (100% passing).
 
 ---
