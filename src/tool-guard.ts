@@ -3,31 +3,70 @@ import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import type { SandboxConfig } from "./config.ts";
 import { decideReadPolicy, decideWritePolicy } from "./policy.ts";
 
+/**
+ * Options provided to the in-process tool guard.
+ */
 export interface ToolGuardOptions {
+  /**
+   * The active sandbox configuration.
+   */
   config: SandboxConfig;
+  /**
+   * Interactive permission prompt callback.
+   * If omitted or in non-interactive / headless mode, decisions requiring 'prompt' fail-closed to block.
+   */
   askPermission?: (message: string, path: string) => Promise<boolean>;
 }
 
 /**
- * Registers in-process interception on pi.on("tool_call") to secure
- * direct Node.js tools: read, write, and edit.
+ * Result returned to Pi when blocking a tool call.
  */
-export function registerToolGuard(pi: ExtensionAPI, getOptions: () => ToolGuardOptions) {
-  pi.on("tool_call", async (event, ctx: ExtensionContext) => {
-    const { config, askPermission } = getOptions();
-    if (config.enabled === false) {
-      return;
-    }
+export interface ToolBlockResult {
+  block: boolean;
+  reason?: string;
+  terminate?: boolean;
+}
 
-    const baseCwd = ctx.cwd || process.cwd();
-    const allowRead = config.filesystem?.allowRead ?? [];
-    const denyRead = config.filesystem?.denyRead ?? [];
-    const allowWrite = config.filesystem?.allowWrite ?? [".", "/tmp"];
-    const denyWrite = config.filesystem?.denyWrite ?? [];
+/**
+ * Evaluates an in-process tool call event and determines if it should be allowed or blocked.
+ * This function is extracted to enable direct, deterministic testing without a live Pi harness.
+ *
+ * Security Model:
+ * - Fail-Closed: If an unhandled error occurs during path inspection or policy evaluation,
+ *   the tool call is immediately blocked.
+ * - Non-Interactive Safe: If askPermission is not provided and the policy returns 'prompt',
+ *   the tool call is blocked immediately.
+ * - Handles read, write, and edit built-in tools.
+ */
+export async function evaluateToolCall(
+  event: unknown,
+  ctx: { cwd: string },
+  options: ToolGuardOptions,
+): Promise<ToolBlockResult | undefined> {
+  const { config, askPermission } = options;
 
+  // If sandbox is explicitly disabled by operator, bypass guard
+  if (config.enabled === false) {
+    return undefined;
+  }
+
+  const baseCwd = ctx.cwd || process.cwd();
+  const allowRead = config.filesystem?.allowRead ?? [];
+  const denyRead = config.filesystem?.denyRead ?? [];
+  const allowWrite = config.filesystem?.allowWrite ?? [".", "/tmp"];
+  const denyWrite = config.filesystem?.denyWrite ?? [];
+
+  try {
     // 1. Guard READ tool
-    if (isToolCallEventType("read", event)) {
-      const targetPath = event.input.path;
+    if (isToolCallEventType("read", event as any)) {
+      const targetPath = (event as any).input?.path;
+      if (typeof targetPath !== "string" || !targetPath.trim()) {
+        return {
+          block: true,
+          reason: "[Security Sandbox] Invalid or empty path provided to 'read' tool.",
+        };
+      }
+
       const decision = decideReadPolicy(targetPath, allowRead, denyRead, baseCwd);
 
       if (decision === "deny") {
@@ -39,20 +78,35 @@ export function registerToolGuard(pi: ExtensionAPI, getOptions: () => ToolGuardO
 
       if (decision === "prompt") {
         if (askPermission) {
-          const approved = await askPermission(`Agent is requesting to READ external file: ${targetPath}`, targetPath);
+          const approved = await askPermission(
+            `Agent is requesting to READ external file: ${targetPath}`,
+            targetPath,
+          );
           if (!approved) {
             return {
               block: true,
               reason: `[Security Sandbox] User denied permission to read '${targetPath}'.`,
             };
           }
+        } else {
+          return {
+            block: true,
+            reason: `[Security Sandbox] Reading path '${targetPath}' outside allowed boundaries requires explicit user approval.`,
+          };
         }
       }
     }
 
     // 2. Guard WRITE tool
-    if (isToolCallEventType("write", event)) {
-      const targetPath = event.input.path;
+    if (isToolCallEventType("write", event as any)) {
+      const targetPath = (event as any).input?.path;
+      if (typeof targetPath !== "string" || !targetPath.trim()) {
+        return {
+          block: true,
+          reason: "[Security Sandbox] Invalid or empty path provided to 'write' tool.",
+        };
+      }
+
       const decision = decideWritePolicy(targetPath, allowWrite, denyWrite, baseCwd);
 
       if (decision === "deny") {
@@ -64,7 +118,10 @@ export function registerToolGuard(pi: ExtensionAPI, getOptions: () => ToolGuardO
 
       if (decision === "prompt") {
         if (askPermission) {
-          const approved = await askPermission(`Agent is requesting to WRITE to file outside workspace: ${targetPath}`, targetPath);
+          const approved = await askPermission(
+            `Agent is requesting to WRITE to file outside workspace: ${targetPath}`,
+            targetPath,
+          );
           if (!approved) {
             return {
               block: true,
@@ -81,8 +138,15 @@ export function registerToolGuard(pi: ExtensionAPI, getOptions: () => ToolGuardO
     }
 
     // 3. Guard EDIT tool
-    if (isToolCallEventType("edit", event)) {
-      const targetPath = event.input.path;
+    if (isToolCallEventType("edit", event as any)) {
+      const targetPath = (event as any).input?.path;
+      if (typeof targetPath !== "string" || !targetPath.trim()) {
+        return {
+          block: true,
+          reason: "[Security Sandbox] Invalid or empty path provided to 'edit' tool.",
+        };
+      }
+
       const decision = decideWritePolicy(targetPath, allowWrite, denyWrite, baseCwd);
 
       if (decision === "deny") {
@@ -94,7 +158,10 @@ export function registerToolGuard(pi: ExtensionAPI, getOptions: () => ToolGuardO
 
       if (decision === "prompt") {
         if (askPermission) {
-          const approved = await askPermission(`Agent is requesting to EDIT file outside workspace: ${targetPath}`, targetPath);
+          const approved = await askPermission(
+            `Agent is requesting to EDIT file outside workspace: ${targetPath}`,
+            targetPath,
+          );
           if (!approved) {
             return {
               block: true,
@@ -109,5 +176,23 @@ export function registerToolGuard(pi: ExtensionAPI, getOptions: () => ToolGuardO
         }
       }
     }
+
+    return undefined; // Tool call permitted
+  } catch (error: any) {
+    // Fail-Closed: If policy evaluation throws unexpectedly, block the call
+    return {
+      block: true,
+      reason: `[Security Sandbox Error] Failed to evaluate security policy safely: ${error?.message || error}. Operation blocked.`,
+    };
+  }
+}
+
+/**
+ * Registers in-process interception on pi.on("tool_call") to secure
+ * direct Node.js tools: read, write, and edit.
+ */
+export function registerToolGuard(pi: ExtensionAPI, getOptions: () => ToolGuardOptions) {
+  pi.on("tool_call", async (event, ctx: ExtensionContext) => {
+    return evaluateToolCall(event, { cwd: ctx.cwd || process.cwd() }, getOptions());
   });
 }
