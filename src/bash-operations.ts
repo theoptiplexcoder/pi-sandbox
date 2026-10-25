@@ -7,10 +7,13 @@ import type { SandboxConfig } from "./config.ts";
 export interface SandboxedBashOptions {
   config: SandboxConfig;
   socketDir?: string;
+  proxyPort?: number;
+  socksPort?: number;
 }
 
 /**
  * Creates a sandboxed implementation of Pi's BashOperations.
+ * Integrates directly with Pi's createBashTool and user_bash hook.
  */
 export function createSandboxedBashOps(getOptions: () => SandboxedBashOptions): BashOperations {
   return {
@@ -19,17 +22,16 @@ export function createSandboxedBashOps(getOptions: () => SandboxedBashOptions): 
         throw new Error(`Working directory does not exist: ${cwd}`);
       }
 
-      const { config, socketDir } = getOptions();
+      const { config, socketDir, proxyPort, socksPort } = getOptions();
 
-      // If sandbox is disabled or bwrap is unavailable, inform operator or fail-safe
+      // If sandbox is explicitly disabled by operator, fall back to direct uncontained execution
       if (config.enabled === false) {
-        // Fall back to direct spawn if explicitly disabled
         return executeSubprocess("bash", ["-c", command], cwd, { onData, signal, timeout });
       }
 
       if (!isBwrapAvailable()) {
         throw new Error(
-          "[claudelike-pisandbox] bubblewrap ('bwrap') is not installed on this system. Cannot execute commands safely.",
+          "[claudelike-pisandbox] bubblewrap ('bwrap') is not installed or accessible on this system. Cannot execute commands safely.",
         );
       }
 
@@ -37,10 +39,12 @@ export function createSandboxedBashOps(getOptions: () => SandboxedBashOptions): 
         cwd,
         config,
         socketDir,
+        proxyPort,
+        socksPort,
         unshareNet: config.network?.enabled !== false,
       });
 
-      // Pass command to bash inside bwrap
+      // Execute bash inside the bubblewrap container
       const finalArgs = [...bwrapArgs, "--", "bash", "-c", command];
 
       return executeSubprocess("bwrap", finalArgs, cwd, { onData, signal, timeout });
@@ -48,6 +52,9 @@ export function createSandboxedBashOps(getOptions: () => SandboxedBashOptions): 
   };
 }
 
+/**
+ * Executes a subprocess in its own process group with proper signal and timeout handling.
+ */
 function executeSubprocess(
   cmd: string,
   args: string[],
@@ -65,7 +72,7 @@ function executeSubprocess(
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, {
       cwd,
-      detached: true, // Run in its own process group
+      detached: true, // Run in its own process group (-pid)
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -108,6 +115,9 @@ function executeSubprocess(
   });
 }
 
+/**
+ * Terminates an entire process tree using negative PID (SIGKILL).
+ */
 function killProcessGroup(pid: number | undefined) {
   if (!pid) return;
   try {
@@ -116,7 +126,7 @@ function killProcessGroup(pid: number | undefined) {
     try {
       process.kill(pid, "SIGKILL");
     } catch {
-      // ignore
+      // Ignore if process group already exited
     }
   }
 }
