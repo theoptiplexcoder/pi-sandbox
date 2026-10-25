@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { expandTilde, MANDATORY_INVARIANTS, type SandboxConfig } from "./config.ts";
@@ -11,6 +11,7 @@ export interface BwrapOptions {
   socketDir?: string;
   proxyPort?: number;
   socksPort?: number;
+  tmpfsBytes?: number; // Cap tmpfs in RAM (default: 512MB)
 }
 
 /**
@@ -55,7 +56,6 @@ export function findNestedSecretsInWorkspace(
       }
     }
   } catch (err) {
-    // If a directory is unreadable or inaccessible, warn loud
     console.error(`[claudelike-pisandbox] Warning: Unreadable directory in workspace: ${dir}:`, err);
   }
 
@@ -63,7 +63,64 @@ export function findNestedSecretsInWorkspace(
 }
 
 /**
- * Whitelist of safe environment variables forwarded to the container.
+ * Resolves the real git directory for standard repositories, worktrees, and submodules.
+ * - If .git is a directory: returns resolved .git path.
+ * - If .git is a file (worktree/submodule): reads "gitdir: <path>" and resolves it.
+ */
+export function resolveGitDirectory(workspaceDir: string): string | null {
+  const gitPath = join(workspaceDir, ".git");
+  if (!existsSync(gitPath)) return null;
+
+  try {
+    const stat = statSync(gitPath);
+    if (stat.isDirectory()) {
+      return gitPath;
+    } else if (stat.isFile()) {
+      // Worktree / submodule pointer file: gitdir: ../../.git/worktrees/my-worktree
+      const content = readFileSync(gitPath, "utf-8").trim();
+      const match = /^gitdir:\s*(.+)$/m.exec(content);
+      if (match && match[1]) {
+        return resolve(workspaceDir, match[1]);
+      }
+    }
+  } catch {
+    // Ignore read errors
+  }
+  return null;
+}
+
+/**
+ * Generates git protection mounts.
+ * Ensures `.git/hooks` is pre-created on the host so an attacker cannot later `mkdir .git/hooks`
+ * inside the sandbox to plant delayed execution hooks. Also mounts `.git/config` as read-only.
+ */
+export function buildGitProtectionMounts(workspaceDir: string): string[] {
+  const mounts: string[] = [];
+  const gitDir = resolveGitDirectory(workspaceDir);
+  if (!gitDir) return mounts;
+
+  try {
+    // 1. Pre-create hooks dir on host so it can be mounted read-only without holes
+    const hooksDir = join(gitDir, "hooks");
+    if (!existsSync(hooksDir)) {
+      mkdirSync(hooksDir, { recursive: true });
+    }
+    mounts.push("--ro-bind", hooksDir, hooksDir);
+
+    // 2. Protect git config if it exists
+    const configPath = join(gitDir, "config");
+    if (existsSync(configPath)) {
+      mounts.push("--ro-bind", configPath, configPath);
+    }
+  } catch {
+    // Ignore git creation errors
+  }
+
+  return mounts;
+}
+
+/**
+ * Strict allowlist of safe environment variables forwarded to the container.
  * Everything else (including AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN, OPENAI_API_KEY, SSH_AUTH_SOCK)
  * is stripped via --clearenv to prevent environment leakage.
  */
@@ -79,30 +136,20 @@ export const SAFE_ENV_VARS = [
   "LC_CTYPE",
   "TZ",
   "NODE_ENV",
+  "GIT_AUTHOR_NAME",
+  "GIT_AUTHOR_EMAIL",
+  "GIT_COMMITTER_NAME",
+  "GIT_COMMITTER_EMAIL",
 ];
 
 /**
  * Builds the bubblewrap CLI arguments implementing OS-level kernel isolation.
- *
- * Hardened Security Features:
- * 1. Root Read-Only (--ro-bind / /): System binaries/libs are readable, but cannot be modified.
- * 2. Pseudo Filesystems: Fresh /dev and /proc mounts.
- * 3. Ephemeral /tmp (--tmpfs /tmp): Isolated temporary storage that vanishes on exit.
- * 4. Mask Sockets & Daemons (--tmpfs /run): Hides /run/user, /var/run/docker.sock, and SSH agent sockets.
- * 5. Environment Cleared (--clearenv): Only explicitly whitelisted environment variables are forwarded.
- * 6. Process Isolation (--new-session, --unshare-pid): Defeats TIOCSTI terminal injection and cleans setsid children.
- * 7. Host Secrets Shadowed (--tmpfs ~/.ssh, ~/.aws, etc.): Empty tmpfs over sensitive credential stores.
- * 8. Writable Workspace strictly bounded (--bind $CWD $CWD).
- * 9. Execution Hooks & Persistence Protected: Remounts read-only over .git/hooks, .git/config, .pi, and .vscode.
- * 10. Nested Secret Masking: Recursively finds all .env, *.key, and secret files inside $CWD (e.g. backend/.env)
- *     and remounts them read-only (--ro-bind).
- * 11. Network Namespace Isolation (--unshare-net): Blocks raw network egress.
  */
 export function buildBwrapArgs(options: BwrapOptions): string[] {
-  const { cwd, config, unshareNet, socketDir } = options;
+  const { cwd, config, unshareNet, socketDir, tmpfsBytes = 536870912 } = options; // Default 512MB RAM cap
   const args: string[] = [];
 
-  // 1. Process & Terminal Isolation (Defeats TIOCSTI keystroke injection & orphans)
+  // 1. Process & Terminal Isolation (Defeats TIOCSTI keystroke injection & setsid orphans)
   args.push("--new-session");
   args.push("--unshare-pid");
   args.push("--die-with-parent");
@@ -114,7 +161,8 @@ export function buildBwrapArgs(options: BwrapOptions): string[] {
   args.push("--dev", "/dev");
   args.push("--proc", "/proc");
 
-  // 4. Ephemeral /tmp
+  // 4. Ephemeral /tmp with RAM size limit
+  args.push("--size", String(tmpfsBytes));
   args.push("--tmpfs", "/tmp");
 
   // 5. Mask host IPC sockets, Docker daemon, and user runtimes
@@ -169,10 +217,12 @@ export function buildBwrapArgs(options: BwrapOptions): string[] {
     }
   }
 
-  // 9. Protect git persistence hooks, configs, and IDE execution settings inside $CWD
+  // 9. Git Persistence & Execution Hook Protection (including worktree support)
+  const gitMounts = buildGitProtectionMounts(resolvedCwd);
+  args.push(...gitMounts);
+
+  // Remount read-only over other project hook directories if present
   const sensitiveCwdPaths = [
-    join(resolvedCwd, ".git", "hooks"),
-    join(resolvedCwd, ".git", "config"),
     join(resolvedCwd, ".pi"),
     join(resolvedCwd, ".vscode", "tasks.json"),
     join(resolvedCwd, ".envrc"),
@@ -201,7 +251,6 @@ export function buildBwrapArgs(options: BwrapOptions): string[] {
       args.push("--setenv", envKey, val);
     }
   }
-  // Ensure HOME and CWD are properly initialized
   args.push("--setenv", "HOME", homedir());
 
   // 12. Network namespace containment
@@ -210,7 +259,6 @@ export function buildBwrapArgs(options: BwrapOptions): string[] {
     args.push("--unshare-net");
 
     // Bind local socket directory if specified
-    // In Phase 4, a local socat bridge forwards inside the sandbox to /run/pi-sandbox/proxy.sock
     if (socketDir && existsSync(socketDir)) {
       args.push("--bind", socketDir, "/run/pi-sandbox");
     }

@@ -1,9 +1,14 @@
 import { describe, expect, it } from "bun:test";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { createSandboxedBashOps } from "../src/bash-operations.ts";
-import { buildBwrapArgs, isBwrapAvailable } from "../src/bwrap.ts";
+import {
+  buildBwrapArgs,
+  buildGitProtectionMounts,
+  isBwrapAvailable,
+  resolveGitDirectory,
+} from "../src/bwrap.ts";
 import { DEFAULT_CONFIG, type SandboxConfig } from "../src/config.ts";
 
 describe("Phase 3: Bubblewrap Subprocess Containment Unit Tests", () => {
@@ -13,11 +18,12 @@ describe("Phase 3: Bubblewrap Subprocess Containment Unit Tests", () => {
     expect(isBwrapAvailable()).toBe(true);
   });
 
-  it("builds hardened bubblewrap argument flags", () => {
+  it("builds hardened bubblewrap argument flags with tmpfs capping", () => {
     const args = buildBwrapArgs({
       cwd,
       config: DEFAULT_CONFIG,
       unshareNet: true,
+      tmpfsBytes: 268435456, // 256MB cap
     });
 
     // 1. Root read-only
@@ -28,7 +34,9 @@ describe("Phase 3: Bubblewrap Subprocess Containment Unit Tests", () => {
     expect(args).toContain("--bind");
     expect(args).toContain(cwd);
 
-    // 3. Ephemeral tmp
+    // 3. Ephemeral tmp with size limit
+    expect(args).toContain("--size");
+    expect(args).toContain("268435456");
     expect(args).toContain("--tmpfs");
     expect(args).toContain("/tmp");
 
@@ -52,6 +60,24 @@ describe("Phase 3: Bubblewrap Subprocess Containment Unit Tests", () => {
     if (sshIndex !== -1) {
       expect(args[sshIndex - 1]).toBe("--tmpfs");
     }
+  });
+
+  it("resolves git directory for standard repos and worktrees", () => {
+    const tempDir = join(tmpdir(), `pi-sandbox-gitdir-test-${Date.now()}`);
+    mkdirSync(tempDir, { recursive: true });
+
+    // Standard repo
+    const standardRepo = join(tempDir, "standard");
+    mkdirSync(join(standardRepo, ".git"), { recursive: true });
+    expect(resolveGitDirectory(standardRepo)).toBe(join(standardRepo, ".git"));
+
+    // Worktree pointer file
+    const worktreeRepo = join(tempDir, "worktree");
+    mkdirSync(worktreeRepo, { recursive: true });
+    writeFileSync(join(worktreeRepo, ".git"), "gitdir: ../standard/.git/worktrees/wt1");
+    expect(resolveGitDirectory(worktreeRepo)).toBe(resolve(worktreeRepo, "../standard/.git/worktrees/wt1"));
+
+    rmSync(tempDir, { recursive: true, force: true });
   });
 });
 
@@ -117,7 +143,6 @@ describe("Phase 3: Live OS Kernel Enforcement & Functional Containment", () => {
     });
 
     expect(res.exitCode).toBe(0);
-    // Inside the empty tmpfs, listing ~/.ssh must yield zero files!
     expect(output.trim()).toBe("");
 
     rmSync(testDir, { recursive: true, force: true });
@@ -134,7 +159,6 @@ describe("Phase 3: Live OS Kernel Enforcement & Functional Containment", () => {
     let stderr = "";
     const ops = createSandboxedBashOps(() => ({ config: DEFAULT_CONFIG }));
 
-    // Command attempts to overwrite nested .env
     const res = await ops.exec("echo 'HAX' > services/backend/.env 2>&1", testDir, {
       onData: (d) => {
         stderr += d.toString();
@@ -143,25 +167,24 @@ describe("Phase 3: Live OS Kernel Enforcement & Functional Containment", () => {
 
     expect(res.exitCode).not.toBe(0);
     expect(stderr.toLowerCase()).toContain("read-only file system");
-
-    // File content remains unaltered
     expect(readFileSync(join(nestedDir, ".env"), "utf-8")).toBe("API_KEY=VERY_SECRET_KEY");
 
     rmSync(testDir, { recursive: true, force: true });
   });
 
-  it("AUDIT FINDING D: protects .git/hooks and .git/config from agent persistence attacks", async () => {
+  it("AUDIT FINDING D: protects .git/hooks and .git/config (pre-creates hooks dir so mkdir fails)", async () => {
     if (!bwrapAvailable) return;
 
     const testDir = join(tmpdir(), `pi-sandbox-test-git-${Date.now()}`);
-    const hooksDir = join(testDir, ".git", "hooks");
-    mkdirSync(hooksDir, { recursive: true });
-    writeFileSync(join(testDir, ".git", "config"), "[core]\n\trepositoryformatversion = 0");
+    const gitDir = join(testDir, ".git");
+    mkdirSync(gitDir, { recursive: true });
+    // Intentionally do NOT create hooks directory on host beforehand
+    writeFileSync(join(gitDir, "config"), "[core]\n\trepositoryformatversion = 0");
 
     let stderr = "";
     const ops = createSandboxedBashOps(() => ({ config: DEFAULT_CONFIG }));
 
-    // Attacker script attempts to implant a malicious pre-commit hook to escape sandbox on next host commit
+    // Attacker attempts to mkdir .git/hooks or write a hook inside sandbox
     const res = await ops.exec("echo 'malicious script' > .git/hooks/pre-commit 2>&1", testDir, {
       onData: (d) => {
         stderr += d.toString();
@@ -170,6 +193,59 @@ describe("Phase 3: Live OS Kernel Enforcement & Functional Containment", () => {
 
     expect(res.exitCode).not.toBe(0);
     expect(stderr.toLowerCase()).toContain("read-only file system");
+
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it("AUDIT HARDENING: git worktree protection resolves real gitdir and protects its hooks", async () => {
+    if (!bwrapAvailable) return;
+
+    const testDir = join(tmpdir(), `pi-sandbox-worktree-test-${Date.now()}`);
+    const mainRepoGit = join(testDir, "main-repo", ".git");
+    const worktreeDir = join(testDir, "worktree-1");
+    const wtGitDir = join(mainRepoGit, "worktrees", "worktree-1");
+
+    mkdirSync(wtGitDir, { recursive: true });
+    mkdirSync(worktreeDir, { recursive: true });
+
+    // Create gitdir pointer file in worktree
+    writeFileSync(join(worktreeDir, ".git"), `gitdir: ${wtGitDir}`);
+    writeFileSync(join(wtGitDir, "config"), "[core]\n\tworktree = true");
+
+    let stderr = "";
+    const ops = createSandboxedBashOps(() => ({ config: DEFAULT_CONFIG }));
+
+    // Inside worktree, attempting to modify git hooks must fail
+    const res = await ops.exec(`echo 'evil' > "${wtGitDir}/hooks/pre-commit" 2>&1`, worktreeDir, {
+      onData: (d) => {
+        stderr += d.toString();
+      },
+    });
+
+    expect(res.exitCode).not.toBe(0);
+    expect(stderr.toLowerCase()).toContain("read-only file system");
+
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it("AUDIT HARDENING: terminal isolation with --new-session detaches controlling tty", async () => {
+    if (!bwrapAvailable) return;
+
+    const testDir = join(tmpdir(), `pi-sandbox-test-tty-${Date.now()}`);
+    mkdirSync(testDir, { recursive: true });
+
+    let output = "";
+    const ops = createSandboxedBashOps(() => ({ config: DEFAULT_CONFIG }));
+
+    // Inside a new session without controlling terminal, opening /dev/tty directly fails with ENXIO
+    const res = await ops.exec("cat /dev/tty 2>&1", testDir, {
+      onData: (d) => {
+        output += d.toString();
+      },
+    });
+
+    expect(res.exitCode).not.toBe(0);
+    expect(output.toLowerCase()).toMatch(/no such device or address|not a tty|cannot open/i);
 
     rmSync(testDir, { recursive: true, force: true });
   });
@@ -194,7 +270,6 @@ describe("Phase 3: Live OS Kernel Enforcement & Functional Containment", () => {
     });
 
     expect(res.exitCode).toBe(0);
-    // Values must be completely blank inside the container
     expect(stdout).toContain("GITHUB_TOKEN=");
     expect(stdout).not.toContain("ghp_super_secret_host_token_12345");
     expect(stdout).not.toContain("aws_secret_key_67890");
@@ -214,7 +289,6 @@ describe("Phase 3: Live OS Kernel Enforcement & Functional Containment", () => {
     let stdout = "";
     const ops = createSandboxedBashOps(() => ({ config: DEFAULT_CONFIG }));
 
-    // Attempt to access host docker socket or run user directory
     const res = await ops.exec("ls /run/docker.sock 2>&1; ls /var/run/docker.sock 2>&1", testDir, {
       onData: (d) => {
         stdout += d.toString();
@@ -257,7 +331,6 @@ describe("Phase 3: Live OS Kernel Enforcement & Functional Containment", () => {
     const controller = new AbortController();
     const ops = createSandboxedBashOps(() => ({ config: DEFAULT_CONFIG }));
 
-    // Schedule abort after 100ms
     setTimeout(() => controller.abort(), 100);
 
     const start = Date.now();
