@@ -2,7 +2,7 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { expandTilde, MANDATORY_INVARIANTS, type SandboxConfig } from "./config.ts";
-import { globToRegex } from "./policy.ts";
+import { isSecretPath } from "./policy.ts";
 
 export interface BwrapOptions {
   cwd: string;
@@ -21,65 +21,110 @@ export function isBwrapAvailable(): boolean {
 }
 
 /**
- * Scans a directory and finds any files matching denyWrite glob patterns (e.g. .env, *.pem, *.key).
+ * Recursively scans the project workspace up to maxDepth (default 8) to locate
+ * all nested secret files matching denyWrite patterns (e.g. backend/.env, certs/*.key).
+ * Skips node_modules to avoid performance penalties, but inspects standard project trees.
  */
-function findMatchingFilesInDir(dir: string, patterns: string[]): string[] {
+export function findNestedSecretsInWorkspace(
+  dir: string,
+  extraDenyPatterns: readonly string[] = [],
+  maxDepth: number = 8,
+  currentDepth: number = 0,
+): string[] {
   const matches: string[] = [];
-  if (!existsSync(dir)) return matches;
+  if (!existsSync(dir) || currentDepth > maxDepth) return matches;
 
   try {
-    const entries = readdirSync(dir);
+    const entries = readdirSync(dir, { withFileTypes: true });
     for (const entry of entries) {
-      for (const pat of patterns) {
-        if (!pat.includes("/") && !pat.includes("\\")) {
-          const regex = globToRegex(pat);
-          if (regex.test(entry)) {
-            matches.push(join(dir, entry));
-            break;
-          }
+      const fullPath = join(dir, entry.name);
+
+      if (entry.isDirectory()) {
+        // Skip node_modules, .git (handled separately for security), .pnpm-store
+        if (entry.name === "node_modules" || entry.name === ".pnpm-store" || entry.name === ".git") {
+          continue;
+        }
+        matches.push(
+          ...findNestedSecretsInWorkspace(fullPath, extraDenyPatterns, maxDepth, currentDepth + 1),
+        );
+      } else if (entry.isFile()) {
+        // Check using single source of truth: isSecretPath
+        if (isSecretPath(fullPath, extraDenyPatterns as string[], dir)) {
+          matches.push(fullPath);
         }
       }
     }
-  } catch {
-    // Ignore unreadable directories
+  } catch (err) {
+    // If a directory is unreadable or inaccessible, warn loud
+    console.error(`[claudelike-pisandbox] Warning: Unreadable directory in workspace: ${dir}:`, err);
   }
 
   return matches;
 }
 
 /**
+ * Whitelist of safe environment variables forwarded to the container.
+ * Everything else (including AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN, OPENAI_API_KEY, SSH_AUTH_SOCK)
+ * is stripped via --clearenv to prevent environment leakage.
+ */
+export const SAFE_ENV_VARS = [
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "TERM",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TZ",
+  "NODE_ENV",
+];
+
+/**
  * Builds the bubblewrap CLI arguments implementing OS-level kernel isolation.
  *
- * Security Model:
+ * Hardened Security Features:
  * 1. Root Read-Only (--ro-bind / /): System binaries/libs are readable, but cannot be modified.
- * 2. Pseudo Filesystems: Mounts fresh /dev and /proc.
+ * 2. Pseudo Filesystems: Fresh /dev and /proc mounts.
  * 3. Ephemeral /tmp (--tmpfs /tmp): Isolated temporary storage that vanishes on exit.
- * 4. Workspace Bound Read-Write (--bind $CWD $CWD): Confined to the target project directory.
- * 5. Secret Masking (--tmpfs ~/.ssh, etc.): Shadowing credential stores with empty tmpfs mounts.
- * 6. In-Workspace Secret Protection (--ro-bind): Existing .env / key files inside $CWD are remounted
- *    read-only so commands cannot overwrite or exfiltrate modified keys.
- * 7. Network Namespace Isolation (--unshare-net): Closes raw network egress.
- * 8. Process Lifetime (--die-with-parent): Kernel terminates container processes if the parent exits.
+ * 4. Mask Sockets & Daemons (--tmpfs /run): Hides /run/user, /var/run/docker.sock, and SSH agent sockets.
+ * 5. Environment Cleared (--clearenv): Only explicitly whitelisted environment variables are forwarded.
+ * 6. Process Isolation (--new-session, --unshare-pid): Defeats TIOCSTI terminal injection and cleans setsid children.
+ * 7. Host Secrets Shadowed (--tmpfs ~/.ssh, ~/.aws, etc.): Empty tmpfs over sensitive credential stores.
+ * 8. Writable Workspace strictly bounded (--bind $CWD $CWD).
+ * 9. Execution Hooks & Persistence Protected: Remounts read-only over .git/hooks, .git/config, .pi, and .vscode.
+ * 10. Nested Secret Masking: Recursively finds all .env, *.key, and secret files inside $CWD (e.g. backend/.env)
+ *     and remounts them read-only (--ro-bind).
+ * 11. Network Namespace Isolation (--unshare-net): Blocks raw network egress.
  */
 export function buildBwrapArgs(options: BwrapOptions): string[] {
-  const { cwd, config, unshareNet, socketDir, proxyPort, socksPort } = options;
+  const { cwd, config, unshareNet, socketDir } = options;
   const args: string[] = [];
 
-  // 1. Root filesystem read-only
+  // 1. Process & Terminal Isolation (Defeats TIOCSTI keystroke injection & orphans)
+  args.push("--new-session");
+  args.push("--unshare-pid");
+  args.push("--die-with-parent");
+
+  // 2. Root filesystem read-only
   args.push("--ro-bind", "/", "/");
 
-  // 2. Kernel pseudo filesystems
+  // 3. Kernel pseudo filesystems
   args.push("--dev", "/dev");
   args.push("--proc", "/proc");
 
-  // 3. Ephemeral /tmp
+  // 4. Ephemeral /tmp
   args.push("--tmpfs", "/tmp");
 
-  // 4. Bind writable workspace directory
+  // 5. Mask host IPC sockets, Docker daemon, and user runtimes
+  args.push("--tmpfs", "/run");
+
+  // 6. Bind writable workspace directory
   const resolvedCwd = resolve(cwd);
   args.push("--bind", resolvedCwd, resolvedCwd);
 
-  // 5. Additional allowed write paths (from trusted config only)
+  // 7. Additional allowed write paths (from trusted config only)
   const allowWrite = config.filesystem?.allowWrite ?? [];
   for (const p of allowWrite) {
     if (p === "." || p === "./") continue;
@@ -89,8 +134,7 @@ export function buildBwrapArgs(options: BwrapOptions): string[] {
     }
   }
 
-  // 6. Mask host secrets with empty tmpfs mounts
-  // Includes mandatory invariants and any extra configured denyRead paths
+  // 8. Mask host secrets with empty tmpfs mounts
   const secretsToMask = new Set<string>();
 
   const allDenyPatterns = [
@@ -125,55 +169,55 @@ export function buildBwrapArgs(options: BwrapOptions): string[] {
     }
   }
 
-  // 7. Protect sensitive files inside cwd by remounting them read-only
-  const allDenyWritePatterns = [
-    ...MANDATORY_INVARIANTS.denyWrite,
-    ...(config.filesystem?.denyWrite ?? []),
+  // 9. Protect git persistence hooks, configs, and IDE execution settings inside $CWD
+  const sensitiveCwdPaths = [
+    join(resolvedCwd, ".git", "hooks"),
+    join(resolvedCwd, ".git", "config"),
+    join(resolvedCwd, ".pi"),
+    join(resolvedCwd, ".vscode", "tasks.json"),
+    join(resolvedCwd, ".envrc"),
   ];
 
-  // A. Protect explicit non-wildcard files
-  for (const p of allDenyWritePatterns) {
-    if (!p.includes("*")) {
-      const absPath = resolve(cwd, expandTilde(p));
-      if (existsSync(absPath)) {
-        args.push("--ro-bind", absPath, absPath);
-      }
+  for (const p of sensitiveCwdPaths) {
+    if (existsSync(p)) {
+      args.push("--ro-bind", p, p);
     }
   }
 
-  // B. Scan workspace root for matching wildcard files (.env, *.pem, *.key)
-  const wildcardPatterns = allDenyWritePatterns.filter((p) => p.includes("*"));
-  const matchedWorkspaceSecrets = findMatchingFilesInDir(resolvedCwd, wildcardPatterns);
-  for (const sec of matchedWorkspaceSecrets) {
+  // 10. Nested workspace secret protection (e.g. backend/.env, api/certs/server.key)
+  const nestedSecrets = findNestedSecretsInWorkspace(
+    resolvedCwd,
+    config.filesystem?.denyWrite ?? [],
+  );
+  for (const sec of nestedSecrets) {
     args.push("--ro-bind", sec, sec);
   }
 
-  // 8. Network namespace containment
+  // 11. Environment Isolation: Clean environment and only forward safe vars
+  args.push("--clearenv");
+  for (const envKey of SAFE_ENV_VARS) {
+    const val = process.env[envKey];
+    if (val !== undefined) {
+      args.push("--setenv", envKey, val);
+    }
+  }
+  // Ensure HOME and CWD are properly initialized
+  args.push("--setenv", "HOME", homedir());
+
+  // 12. Network namespace containment
   const networkSandboxed = unshareNet ?? config.network?.enabled !== false;
   if (networkSandboxed) {
     args.push("--unshare-net");
 
     // Bind local socket directory if specified
+    // In Phase 4, a local socat bridge forwards inside the sandbox to /run/pi-sandbox/proxy.sock
     if (socketDir && existsSync(socketDir)) {
       args.push("--bind", socketDir, "/run/pi-sandbox");
     }
-
-    // Set proxy environment variables if ports/sockets are specified
-    if (proxyPort) {
-      args.push("--setenv", "http_proxy", `http://127.0.0.1:${proxyPort}`);
-      args.push("--setenv", "https_proxy", `http://127.0.0.1:${proxyPort}`);
-      args.push("--setenv", "HTTP_PROXY", `http://127.0.0.1:${proxyPort}`);
-      args.push("--setenv", "HTTPS_PROXY", `http://127.0.0.1:${proxyPort}`);
-    }
-    if (socksPort) {
-      args.push("--setenv", "all_proxy", `socks5h://127.0.0.1:${socksPort}`);
-      args.push("--setenv", "ALL_PROXY", `socks5h://127.0.0.1:${socksPort}`);
-    }
   }
 
-  // 9. Standard environment configuration
+  // 13. Process execution directory
   args.push("--chdir", resolvedCwd);
-  args.push("--die-with-parent");
 
   return args;
 }

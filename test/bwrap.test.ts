@@ -13,12 +13,11 @@ describe("Phase 3: Bubblewrap Subprocess Containment Unit Tests", () => {
     expect(isBwrapAvailable()).toBe(true);
   });
 
-  it("builds strict bubblewrap argument flags", () => {
+  it("builds hardened bubblewrap argument flags", () => {
     const args = buildBwrapArgs({
       cwd,
       config: DEFAULT_CONFIG,
       unshareNet: true,
-      proxyPort: 8080,
     });
 
     // 1. Root read-only
@@ -33,17 +32,21 @@ describe("Phase 3: Bubblewrap Subprocess Containment Unit Tests", () => {
     expect(args).toContain("--tmpfs");
     expect(args).toContain("/tmp");
 
-    // 4. Network unshared
-    expect(args).toContain("--unshare-net");
+    // 4. Mask host sockets and daemon runtime (/run, /var/run/docker.sock)
+    expect(args).toContain("/run");
 
-    // 5. Proxy environment variables
-    expect(args).toContain("--setenv");
-    expect(args).toContain("http_proxy");
-
-    // 6. Process die with parent
+    // 5. Hardened process isolation
+    expect(args).toContain("--new-session");
+    expect(args).toContain("--unshare-pid");
     expect(args).toContain("--die-with-parent");
 
-    // 7. Secret masking
+    // 6. Environment scrubbed via --clearenv
+    expect(args).toContain("--clearenv");
+
+    // 7. Network unshared
+    expect(args).toContain("--unshare-net");
+
+    // 8. Secret masking
     const sshDir = `${homedir()}/.ssh`;
     const sshIndex = args.indexOf(sshDir);
     if (sshIndex !== -1) {
@@ -120,18 +123,19 @@ describe("Phase 3: Live OS Kernel Enforcement & Functional Containment", () => {
     rmSync(testDir, { recursive: true, force: true });
   });
 
-  it("protects existing .env files in CWD by remounting read-only", async () => {
+  it("AUDIT FINDING A: recursively protects nested secrets (e.g. backend/.env)", async () => {
     if (!bwrapAvailable) return;
 
-    const testDir = join(tmpdir(), `pi-sandbox-test-env-${Date.now()}`);
-    mkdirSync(testDir, { recursive: true });
-    writeFileSync(join(testDir, ".env"), "SECRET=ORIGINAL_KEY");
+    const testDir = join(tmpdir(), `pi-sandbox-test-nested-${Date.now()}`);
+    const nestedDir = join(testDir, "services", "backend");
+    mkdirSync(nestedDir, { recursive: true });
+    writeFileSync(join(nestedDir, ".env"), "API_KEY=VERY_SECRET_KEY");
 
     let stderr = "";
     const ops = createSandboxedBashOps(() => ({ config: DEFAULT_CONFIG }));
 
-    // Command attempts to overwrite .env
-    const res = await ops.exec("echo 'OVERWRITTEN' > .env 2>&1", testDir, {
+    // Command attempts to overwrite nested .env
+    const res = await ops.exec("echo 'HAX' > services/backend/.env 2>&1", testDir, {
       onData: (d) => {
         stderr += d.toString();
       },
@@ -140,8 +144,85 @@ describe("Phase 3: Live OS Kernel Enforcement & Functional Containment", () => {
     expect(res.exitCode).not.toBe(0);
     expect(stderr.toLowerCase()).toContain("read-only file system");
 
-    // File content remains unchanged
-    expect(readFileSync(join(testDir, ".env"), "utf-8")).toBe("SECRET=ORIGINAL_KEY");
+    // File content remains unaltered
+    expect(readFileSync(join(nestedDir, ".env"), "utf-8")).toBe("API_KEY=VERY_SECRET_KEY");
+
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it("AUDIT FINDING D: protects .git/hooks and .git/config from agent persistence attacks", async () => {
+    if (!bwrapAvailable) return;
+
+    const testDir = join(tmpdir(), `pi-sandbox-test-git-${Date.now()}`);
+    const hooksDir = join(testDir, ".git", "hooks");
+    mkdirSync(hooksDir, { recursive: true });
+    writeFileSync(join(testDir, ".git", "config"), "[core]\n\trepositoryformatversion = 0");
+
+    let stderr = "";
+    const ops = createSandboxedBashOps(() => ({ config: DEFAULT_CONFIG }));
+
+    // Attacker script attempts to implant a malicious pre-commit hook to escape sandbox on next host commit
+    const res = await ops.exec("echo 'malicious script' > .git/hooks/pre-commit 2>&1", testDir, {
+      onData: (d) => {
+        stderr += d.toString();
+      },
+    });
+
+    expect(res.exitCode).not.toBe(0);
+    expect(stderr.toLowerCase()).toContain("read-only file system");
+
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it("AUDIT HARDENING: scrubs host environment variables (e.g. GITHUB_TOKEN, AWS_SECRET_ACCESS_KEY)", async () => {
+    if (!bwrapAvailable) return;
+
+    const testDir = join(tmpdir(), `pi-sandbox-test-env-scrub-${Date.now()}`);
+    mkdirSync(testDir, { recursive: true });
+
+    // Inject temporary secret into host process.env for this test
+    process.env.GITHUB_TOKEN = "ghp_super_secret_host_token_12345";
+    process.env.AWS_SECRET_ACCESS_KEY = "aws_secret_key_67890";
+
+    let stdout = "";
+    const ops = createSandboxedBashOps(() => ({ config: DEFAULT_CONFIG }));
+
+    const res = await ops.exec("echo GITHUB_TOKEN=$GITHUB_TOKEN; echo AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY", testDir, {
+      onData: (d) => {
+        stdout += d.toString();
+      },
+    });
+
+    expect(res.exitCode).toBe(0);
+    // Values must be completely blank inside the container
+    expect(stdout).toContain("GITHUB_TOKEN=");
+    expect(stdout).not.toContain("ghp_super_secret_host_token_12345");
+    expect(stdout).not.toContain("aws_secret_key_67890");
+
+    delete process.env.GITHUB_TOKEN;
+    delete process.env.AWS_SECRET_ACCESS_KEY;
+
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it("AUDIT HARDENING: masks host IPC sockets and docker.sock via /run tmpfs", async () => {
+    if (!bwrapAvailable) return;
+
+    const testDir = join(tmpdir(), `pi-sandbox-test-sockets-${Date.now()}`);
+    mkdirSync(testDir, { recursive: true });
+
+    let stdout = "";
+    const ops = createSandboxedBashOps(() => ({ config: DEFAULT_CONFIG }));
+
+    // Attempt to access host docker socket or run user directory
+    const res = await ops.exec("ls /run/docker.sock 2>&1; ls /var/run/docker.sock 2>&1", testDir, {
+      onData: (d) => {
+        stdout += d.toString();
+      },
+    });
+
+    expect(res.exitCode).not.toBe(0);
+    expect(stdout.toLowerCase()).toContain("no such file or directory");
 
     rmSync(testDir, { recursive: true, force: true });
   });
@@ -155,7 +236,6 @@ describe("Phase 3: Live OS Kernel Enforcement & Functional Containment", () => {
     let stderr = "";
     const ops = createSandboxedBashOps(() => ({ config: DEFAULT_CONFIG }));
 
-    // In unshared net namespace with no interface up, DNS or IP connection immediately fails
     const res = await ops.exec("curl --connect-timeout 2 -I https://github.com 2>&1", testDir, {
       onData: (d) => {
         stderr += d.toString();
@@ -163,7 +243,6 @@ describe("Phase 3: Live OS Kernel Enforcement & Functional Containment", () => {
     });
 
     expect(res.exitCode).not.toBe(0);
-    // Curl returns Could not resolve host or Network unreachable
     expect(stderr).toMatch(/Could not resolve host|Network is unreachable|Failed to connect/i);
 
     rmSync(testDir, { recursive: true, force: true });
@@ -187,10 +266,10 @@ describe("Phase 3: Live OS Kernel Enforcement & Functional Containment", () => {
         onData: () => {},
         signal: controller.signal,
       });
-      expect(true).toBe(false); // Should not reach here
+      expect(true).toBe(false);
     } catch (err: any) {
       expect(err.message).toBe("aborted");
-      expect(Date.now() - start).toBeLessThan(1000); // Exited promptly
+      expect(Date.now() - start).toBeLessThan(1000);
     }
 
     rmSync(testDir, { recursive: true, force: true });
@@ -208,12 +287,12 @@ describe("Phase 3: Live OS Kernel Enforcement & Functional Containment", () => {
     try {
       await ops.exec("sleep 10", testDir, {
         onData: () => {},
-        timeout: 1, // 1 second timeout
+        timeout: 1,
       });
-      expect(true).toBe(false); // Should not reach here
+      expect(true).toBe(false);
     } catch (err: any) {
       expect(err.message).toBe("timeout:1");
-      expect(Date.now() - start).toBeLessThan(2000); // Exited promptly
+      expect(Date.now() - start).toBeLessThan(2000);
     }
 
     rmSync(testDir, { recursive: true, force: true });

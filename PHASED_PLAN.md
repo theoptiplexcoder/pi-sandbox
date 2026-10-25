@@ -129,39 +129,45 @@ Secure Pi's direct Node.js built-in tools (`read`, `write`, `edit`) from prompt 
 ### Objective
 Enforce kernel-level filesystem isolation, process hierarchy controls, and command containment for all shell executions (`bash` tool calls and interactive `!` commands).
 
+### Security Architecture & Hardening Model
+1. **Root Read-Only (`--ro-bind / /`)**: All host binaries and configurations are immutable.
+2. **Hardened Process Isolation**:
+   - `--new-session`: Prevents terminal `TIOCSTI` keystroke injection attacks.
+   - `--unshare-pid`: PIDs inside container are isolated; prevents escaping signals or setsid daemon persistence.
+   - `--die-with-parent`: Eliminates orphaned processes if the parent crashes.
+3. **IPC & Daemon Socket Masking (`--tmpfs /run`)**:
+   - Shadows host runtime sockets (`/run/user/UID`, `SSH_AUTH_SOCK`, `/var/run/docker.sock`), preventing unauthorized Docker daemon escalation or SSH agent credential theft.
+4. **Environment Cleared (`--clearenv`)**:
+   - Clears all host environment variables, forwarding only explicitly whitelisted safe variables (`PATH`, `HOME`, `USER`, `SHELL`, `LANG`, etc.).
+   - Prevents exfiltration of tokens and keys (`AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`).
+5. **Execution Hook & Git Persistence Protection**:
+   - Remounts read-only over `.git/hooks`, `.git/config`, `.pi`, `.vscode/tasks.json`, and `.envrc` inside `$CWD` to prevent delayed code execution attacks outside the sandbox upon host commits.
+6. **Nested Workspace Secret Protection**:
+   - Recursively scans workspace directories (up to depth 8) and remounts any `.env`, `.env.*`, `*.pem`, `*.key` files read-only (`--ro-bind`), protecting nested subprojects (e.g. `services/backend/.env`).
+7. **Documented Architectural Boundary (Finding B)**:
+   - Bubblewrap mounts require pre-existing files on disk. Non-existent files (e.g. an attacker planning to create a future `.env`) cannot be bind-mounted without creating empty placeholders on the host. Phase 2's in-process tool guard blocks direct `write` calls to `.env`, and planting a fresh unread `.env` is harmless inside the container.
+8. **Network Boundary (Finding C)**:
+   - Subprocesses run with `--unshare-net`. Outbound proxying in Phase 4 uses a local bridge (`socat` or Unix domain socket forwarder) rather than unreachable `127.0.0.1` TCP variables.
+
 ### Modules to Build & Refine
 1. **`src/bwrap.ts`**:
-   - `isBwrapAvailable(): boolean`:
-     - Checks host for `/usr/bin/bwrap` or `/bin/bwrap`.
-   - `buildBwrapArgs(options: BwrapOptions): string[]`:
-     - Generates deterministic CLI arguments for `bwrap`:
-       - `--ro-bind / /`: Entire host root filesystem is mounted read-only.
-       - `--dev /dev` & `--proc /proc`: Standard kernel pseudo-filesystems.
-       - `--tmpfs /tmp`: Isolated ephemeral `/tmp` namespace.
-       - `--bind $CWD $CWD`: Read-write bind mount strictly limited to current project root.
-       - `--bind $PATH $PATH`: Binds any extra authorized absolute write paths from `config.filesystem.allowWrite`.
-       - Secret Masking: Mounts empty `--tmpfs` over sensitive directories (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.netrc`, and any path in `denyRead`).
-       - DenyWrite Protection: Mounts `--ro-bind` over files in `denyWrite` (e.g. `$CWD/.env`) so even within `$CWD`, scripts cannot modify them.
-       - `--unshare-net`: Isolates network namespace (wired to proxy in Phase 4).
-       - `--die-with-parent`: Eliminates orphaned processes if the parent crashes.
-       - `--chdir $CWD`: Sets isolated process working directory.
-
+   - `isBwrapAvailable(): boolean`
+   - `findNestedSecretsInWorkspace(dir, patterns, maxDepth)`: recursive secret discovery.
+   - `buildBwrapArgs(options: BwrapOptions): string[]`: comprehensive hardened argument generator.
 2. **`src/bash-operations.ts`**:
    - `createSandboxedBashOps(getOptions: () => SandboxedBashOptions): BashOperations`:
-     - Implements Pi's `BashOperations` interface (`exec(command, cwd, { onData, signal, timeout })`).
-     - Spawns subprocess with `detached: true` into its own process group.
-     - Process group lifecycle cleanup: on timeout or `signal.abort`, terminates the entire process tree via `process.kill(-child.pid, "SIGKILL")`.
-
-### Developer Documentation Standards
-- Detailed explanation of each bubblewrap flag, namespace semantics, and why tmpfs masking is used over bind-mounting `/dev/null`.
-- Documentation of process group signal propagation (`-child.pid`).
+     - Process group lifecycle cleanup (`process.kill(-child.pid, "SIGKILL")`).
 
 ### Verification & Definition of Done (DoD)
-- Unit & functional test suite: `test/bwrap.test.ts`
+- Functional test suite: `test/bwrap.test.ts` (exercised through real `bwrap` execution)
 - Tests must verify:
   - Command execution inside `$CWD` works.
-  - Writing outside `$CWD` (`touch /etc/test.tmp` or `touch ~/.bashrc`) triggers a read-only filesystem error.
+  - Writing outside `$CWD` (`touch /etc/test.tmp`) triggers a read-only filesystem error.
   - Secret directories (`~/.ssh`) appear completely empty inside the container.
+  - Nested secrets (`services/backend/.env`) are protected with read-only remounts.
+  - Git persistence hooks (`.git/hooks/pre-commit`) are read-only.
+  - Host environment variables (`GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`) are scrubbed.
+  - Host sockets (`/run/docker.sock`) are inaccessible.
   - Timeouts and abort signals clean up all spawned child processes.
 - Command: `bun test test/bwrap.test.ts` (100% passing).
 
