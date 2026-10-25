@@ -1,5 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createBashTool } from "@earendil-works/pi-coding-agent";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { createSandboxedBashOps } from "./src/bash-operations.ts";
 import { isBwrapAvailable } from "./src/bwrap.ts";
 import { loadConfig, type SandboxConfig } from "./src/config.ts";
@@ -7,6 +9,52 @@ import { startProxyServer, type ProxyServerManager } from "./src/proxy/proxy-ser
 import { registerToolGuard } from "./src/tool-guard.ts";
 import { promptPermission } from "./src/ui.ts";
 
+/**
+ * Saves a granted permission permanently to project-local `.pi/sandbox.json`.
+ */
+export function saveProjectGrant(cwd: string, type: "domain" | "writePath", value: string): void {
+  const piDir = join(cwd, ".pi");
+  const configPath = join(piDir, "sandbox.json");
+
+  try {
+    if (!existsSync(piDir)) {
+      mkdirSync(piDir, { recursive: true });
+    }
+
+    let existing: Partial<SandboxConfig> = {};
+    if (existsSync(configPath)) {
+      try {
+        existing = JSON.parse(readFileSync(configPath, "utf-8"));
+      } catch {
+        existing = {};
+      }
+    }
+
+    if (type === "domain") {
+      const allowed = new Set(existing.network?.allowedDomains ?? []);
+      allowed.add(value);
+      existing.network = {
+        ...existing.network,
+        allowedDomains: Array.from(allowed),
+      };
+    } else if (type === "writePath") {
+      const allowed = new Set(existing.filesystem?.allowWrite ?? []);
+      allowed.add(value);
+      existing.filesystem = {
+        ...existing.filesystem,
+        allowWrite: Array.from(allowed),
+      };
+    }
+
+    writeFileSync(configPath, JSON.stringify(existing, null, 2) + "\n", "utf-8");
+  } catch (err) {
+    console.error(`[claudelike-pisandbox] Warning: Failed to save grant to ${configPath}:`, err);
+  }
+}
+
+/**
+ * Extension entry point activated by Pi harness.
+ */
 export default function activate(pi: ExtensionAPI) {
   let activeConfig: SandboxConfig = loadConfig();
   let proxyManager: ProxyServerManager | null = null;
@@ -36,14 +84,19 @@ export default function activate(pi: ExtensionAPI) {
     };
   };
 
-  // 1. In-Process Tool Guard (Node.js direct tools: read, write, edit)
+  // 1. In-Process Tool Guard (Node.js direct tools: read, write, edit, grep, find, ls)
   registerToolGuard(pi, () => ({
     config: getEffectiveConfig(),
     askPermission: async (message, path) => {
       if (!activeContext) return false;
       const decision = await promptPermission(activeContext, message, path);
-      if (decision === "session" || decision === "project") {
+      if (decision === "session") {
         sessionAllowedPaths.add(path);
+        return true;
+      }
+      if (decision === "project") {
+        sessionAllowedPaths.add(path);
+        saveProjectGrant(activeContext.cwd || process.cwd(), "writePath", path);
         return true;
       }
       return false;
@@ -73,7 +126,8 @@ export default function activate(pi: ExtensionAPI) {
     },
   });
 
-  pi.on("user_bash", () => {
+  pi.on("user_bash", (_event, ctx) => {
+    activeContext = ctx;
     if (!activeConfig.enabled) return;
     return { operations: sandboxedBashOps };
   });
@@ -98,21 +152,29 @@ export default function activate(pi: ExtensionAPI) {
     }
 
     try {
-      proxyManager = await startProxyServer(getEffectiveConfig, async (domain) => {
-        if (!activeContext) return false;
-        const decision = await promptPermission(
-          activeContext,
-          "Subprocess requested outbound connection",
-          domain,
-        );
-        if (decision === "session" || decision === "project") {
-          sessionAllowedDomains.add(domain);
-          return true;
-        }
-        return false;
+      proxyManager = await startProxyServer({
+        getConfig: getEffectiveConfig,
+        onUnknownDomain: async (domain) => {
+          if (!activeContext) return false;
+          const decision = await promptPermission(
+            activeContext,
+            "Subprocess requested outbound network connection",
+            domain,
+          );
+          if (decision === "session") {
+            sessionAllowedDomains.add(domain);
+            return true;
+          }
+          if (decision === "project") {
+            sessionAllowedDomains.add(domain);
+            saveProjectGrant(activeContext.cwd || process.cwd(), "domain", domain);
+            return true;
+          }
+          return false;
+        },
       });
 
-      ctx.ui.setStatus("claudelike-pisandbox", "🔒 Sandbox Active (bwrap + proxy)");
+      ctx.ui.setStatus("claudelike-pisandbox", "🔒 Sandbox Active");
     } catch (err) {
       console.error("[claudelike-pisandbox] Failed to start network proxy:", err);
       ctx.ui.setStatus("claudelike-pisandbox", "⚠️ Sandbox: proxy failed");
@@ -128,22 +190,23 @@ export default function activate(pi: ExtensionAPI) {
 
   // 4. Slash Commands
   pi.registerCommand("sandbox", {
-    description: "Display current security sandbox policy and allowances",
+    description: "Display current security sandbox policy, allowed domains, and grants",
     handler: async (_args, ctx) => {
       const cfg = getEffectiveConfig();
       const output = [
-        "🔒 claudelike-pisandbox status:",
-        `  Status: ${cfg.enabled ? "Active" : "Disabled"}`,
-        `  Bwrap available: ${isBwrapAvailable() ? "Yes" : "No"}`,
-        `  Network proxy: ${proxyManager ? "Online" : "Offline"}`,
+        "🔒 claudelike-pisandbox Status & Active Policies:",
+        `  Status: ${cfg.enabled ? "ACTIVE" : "DISABLED"}`,
+        `  Bubblewrap OS Containment: ${isBwrapAvailable() ? "Available (Kernel Enforced)" : "MISSING"}`,
+        `  Domain Filtering Proxy: ${proxyManager ? "Online (Unix Socket Bridge)" : "Offline"}`,
         "",
-        "Filesystem Rules:",
-        `  Allow Write: ${(cfg.filesystem?.allowWrite ?? []).join(", ")}`,
-        `  Deny Read: ${(cfg.filesystem?.denyRead ?? []).join(", ")}`,
-        `  Deny Write: ${(cfg.filesystem?.denyWrite ?? []).join(", ")}`,
+        "Filesystem Policy:",
+        `  Allow Write: ${(cfg.filesystem?.allowWrite ?? []).join(", ") || "(none)"}`,
+        `  Deny Read: ${(cfg.filesystem?.denyRead ?? []).slice(0, 10).join(", ")}... (${cfg.filesystem?.denyRead?.length ?? 0} total)`,
+        `  Deny Write: ${(cfg.filesystem?.denyWrite ?? []).slice(0, 10).join(", ")}... (${cfg.filesystem?.denyWrite?.length ?? 0} total)`,
         "",
-        "Network Rules:",
-        `  Allowed Domains: ${(cfg.network?.allowedDomains ?? []).join(", ")}`,
+        "Network Policy:",
+        `  Allowed Domains: ${(cfg.network?.allowedDomains ?? []).join(", ") || "(none)"}`,
+        `  Session Grants: ${Array.from(sessionAllowedDomains).join(", ") || "(none)"}`,
       ];
       ctx.ui.notify(output.join("\n"), "info");
     },
