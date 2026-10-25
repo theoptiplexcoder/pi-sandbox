@@ -6,7 +6,9 @@ import {
   DEFAULT_CONFIG,
   expandTilde,
   loadConfig,
-  mergeConfigs,
+  MANDATORY_INVARIANTS,
+  mergeGlobalConfig,
+  mergeProjectConfig,
   normalizeConfigPath,
   type SandboxConfig,
 } from "../src/config.ts";
@@ -14,11 +16,13 @@ import {
   canonicalizePath,
   decideReadPolicy,
   decideWritePolicy,
+  globToRegex,
+  isPathContained,
   isSecretPath,
   matchesPattern,
 } from "../src/policy.ts";
 
-describe("Phase 1: Configuration Management (src/config.ts)", () => {
+describe("Phase 1: Configuration Trust Hierarchy (src/config.ts)", () => {
   const cwd = process.cwd();
 
   it("expands tilde to home directory", () => {
@@ -34,69 +38,102 @@ describe("Phase 1: Configuration Management (src/config.ts)", () => {
     expect(normalizeConfigPath("~/.ssh/id_rsa", cwd)).toBe(join(homedir(), ".ssh", "id_rsa"));
   });
 
-  it("merges configs with union array semantics and overrides flags", () => {
-    const base: SandboxConfig = {
+  it("ADVERSARIAL: Untrusted project config cannot disable the sandbox", () => {
+    const trustedBase: SandboxConfig = {
+      ...DEFAULT_CONFIG,
       enabled: true,
-      network: {
-        enabled: true,
-        allowedDomains: ["github.com"],
-        deniedDomains: [],
-      },
-      filesystem: {
-        allowWrite: ["."],
-        denyRead: ["~/.ssh"],
-      },
     };
 
-    const override: Partial<SandboxConfig> = {
+    const maliciousProjectConfig: Partial<SandboxConfig> = {
       enabled: false,
-      network: {
-        allowedDomains: ["*.npmjs.org"],
-        deniedDomains: ["evil.com"],
-      },
-      filesystem: {
-        allowWrite: ["/var/log"],
-        denyRead: ["/etc/shadow"],
-      },
     };
 
-    const merged = mergeConfigs(base, override);
-    expect(merged.enabled).toBe(false);
-    expect(merged.network?.allowedDomains).toEqual(["github.com", "*.npmjs.org"]);
-    expect(merged.network?.deniedDomains).toEqual(["evil.com"]);
-    expect(merged.filesystem?.allowWrite).toEqual([".", "/var/log"]);
-    expect(merged.filesystem?.denyRead).toEqual(["~/.ssh", "/etc/shadow"]);
+    const merged = mergeProjectConfig(trustedBase, maliciousProjectConfig);
+    expect(merged.enabled).toBe(true); // Must remain true!
   });
 
-  it("loads and merges project-local config over global config", () => {
-    const tempDir = join(tmpdir(), `sandbox-test-conf-${Date.now()}`);
-    const globalFile = join(tempDir, "global.json");
-    const projectFile = join(tempDir, "project.json");
+  it("ADVERSARIAL: Untrusted project config cannot remove mandatory deny rules", () => {
+    const trustedBase = DEFAULT_CONFIG;
 
-    mkdirSync(tempDir, { recursive: true });
+    const maliciousProjectConfig: Partial<SandboxConfig> = {
+      filesystem: {
+        denyRead: [], // Attempt to clear denyRead
+        denyWrite: [], // Attempt to clear denyWrite
+        allowRead: ["~/.ssh", "/etc/shadow"], // Attempt to whitelist credentials
+      },
+    };
 
-    writeFileSync(
-      globalFile,
-      JSON.stringify({
-        network: { allowedDomains: ["global.com"] },
-      }),
-    );
+    const merged = mergeProjectConfig(trustedBase, maliciousProjectConfig);
 
-    writeFileSync(
-      projectFile,
-      JSON.stringify({
-        network: { allowedDomains: ["project.com"] },
-        filesystem: { allowWrite: ["/opt/data"] },
-      }),
-    );
+    // Mandatory deny rules must still be present
+    expect(merged.filesystem?.denyRead).toContain("~/.ssh");
+    expect(merged.filesystem?.denyRead).toContain("/etc/shadow");
+    expect(merged.filesystem?.denyWrite).toContain(".env");
 
-    const loaded = loadConfig(tempDir, { global: globalFile, project: projectFile });
+    // Attempted secret allowRead must be pruned
+    expect(merged.filesystem?.allowRead).not.toContain("~/.ssh");
+    expect(merged.filesystem?.allowRead).not.toContain("/etc/shadow");
+  });
 
-    expect(loaded.network?.allowedDomains).toContain("global.com");
-    expect(loaded.network?.allowedDomains).toContain("project.com");
-    expect(loaded.filesystem?.allowWrite).toContain("/opt/data");
+  it("ADVERSARIAL: Untrusted project config can only tighten restrictions", () => {
+    const trustedBase = DEFAULT_CONFIG;
 
-    rmSync(tempDir, { recursive: true, force: true });
+    const projectConfig: Partial<SandboxConfig> = {
+      filesystem: {
+        denyRead: ["./proprietary-dataset"],
+        denyWrite: ["./release-notes.md"],
+      },
+      network: {
+        deniedDomains: ["untrusted-cdn.com"],
+      },
+    };
+
+    const merged = mergeProjectConfig(trustedBase, projectConfig);
+    expect(merged.filesystem?.denyRead).toContain("./proprietary-dataset");
+    expect(merged.filesystem?.denyWrite).toContain("./release-notes.md");
+    expect(merged.network?.deniedDomains).toContain("untrusted-cdn.com");
+  });
+});
+
+describe("Phase 1: Directory Containment & Sibling Protection", () => {
+  it("correctly identifies path containment using isPathContained", () => {
+    const root = "/home/advik/project";
+
+    // Direct child
+    expect(isPathContained(root, "/home/advik/project/src/main.ts")).toBe(true);
+    // Root itself
+    expect(isPathContained(root, "/home/advik/project")).toBe(true);
+    // Deeply nested child
+    expect(isPathContained(root, "/home/advik/project/deep/sub/dir/file.txt")).toBe(true);
+
+    // ADVERSARIAL: Sibling directory attack (starts with same prefix string)
+    expect(isPathContained(root, "/home/advik/project-secret")).toBe(false);
+    expect(isPathContained(root, "/home/advik/project-secret/passwords.txt")).toBe(false);
+
+    // Parent directory traversal
+    expect(isPathContained(root, "/home/advik")).toBe(false);
+    expect(isPathContained(root, "/etc/passwd")).toBe(false);
+  });
+});
+
+describe("Phase 1: Glob Semantics & Wildcard Matching", () => {
+  it("differentiates single-component wildcard (*) from recursive (**)", () => {
+    const singleGlob = globToRegex("/tmp/*.txt");
+    expect(singleGlob.test("/tmp/file.txt")).toBe(true);
+    // Must NOT match nested subdirectories
+    expect(singleGlob.test("/tmp/nested/file.txt")).toBe(false);
+
+    const recursiveGlob = globToRegex("/tmp/**/*.txt");
+    expect(recursiveGlob.test("/tmp/nested/file.txt")).toBe(true);
+    expect(recursiveGlob.test("/tmp/a/b/c/file.txt")).toBe(true);
+  });
+
+  it("matches filename globs without matching directory separators", () => {
+    const envGlob = globToRegex(".env*");
+    expect(envGlob.test(".env")).toBe(true);
+    expect(envGlob.test(".env.local")).toBe(true);
+    expect(envGlob.test(".env.production")).toBe(true);
+    expect(envGlob.test(".env/subfile")).toBe(false); // Does not match slash
   });
 });
 
@@ -129,13 +166,13 @@ describe("Phase 1: Policy Engine & Canonicalization (src/policy.ts)", () => {
     }
   });
 
-  it("matches filename globs and path patterns", () => {
-    expect(matchesPattern(".env", [".env*"], cwd)).toBe(true);
-    expect(matchesPattern(".env.production", [".env*"], cwd)).toBe(true);
-    expect(matchesPattern("server.key", ["*.key"], cwd)).toBe(true);
-    expect(matchesPattern("cert.pem", ["*.pem"], cwd)).toBe(true);
-    expect(matchesPattern("/var/log/my-app.log", ["/var/log/*.log"], cwd)).toBe(true);
-    expect(matchesPattern("~/.ssh/id_rsa", ["~/.ssh"], cwd)).toBe(true);
+  it("ADVERSARIAL: Agent cannot inspect or modify its own sandbox policies", () => {
+    expect(isSecretPath(".pi/sandbox.json", [], cwd)).toBe(true);
+    expect(isSecretPath(".pi/settings.json", [], cwd)).toBe(true);
+    expect(isSecretPath("~/.pi/agent/sandbox.json", [], cwd)).toBe(true);
+
+    expect(decideWritePolicy(".pi/sandbox.json", [".", "/tmp"], [], cwd)).toBe("deny");
+    expect(decideWritePolicy("~/.pi/agent/sandbox.json", [".", "/tmp"], [], cwd)).toBe("deny");
   });
 
   it("detects sensitive credentials with isSecretPath", () => {
@@ -173,8 +210,11 @@ describe("Phase 1: Policy Engine & Canonicalization (src/policy.ts)", () => {
     expect(decideWritePolicy("src/app.ts", [".", "/tmp"], [], cwd)).toBe("allow");
     expect(decideWritePolicy("/tmp/debug.log", [".", "/tmp"], [], cwd)).toBe("allow");
 
-    // Writing outside workspace requires prompt
-    expect(decideWritePolicy("/etc/hosts", [".", "/tmp"], [], cwd)).toBe("prompt");
+    // Writing to system directories in MANDATORY_INVARIANTS.denyWrite (/etc, /usr, /boot) is denied immediately
+    expect(decideWritePolicy("/etc/hosts", [".", "/tmp"], [], cwd)).toBe("deny");
+
+    // Writing outside workspace to non-system file requires prompt
+    expect(decideWritePolicy("/var/log/custom.log", [".", "/tmp"], [], cwd)).toBe("prompt");
     expect(decideWritePolicy("/home/user/.bashrc", [".", "/tmp"], [], cwd)).toBe("prompt");
 
     // Writing to custom allowed absolute path is allowed

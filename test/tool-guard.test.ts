@@ -26,7 +26,10 @@ describe("In-Process Tool Guard Policies", () => {
   });
 
   it("requires prompt when writing outside workspace", () => {
-    expect(decideWritePolicy("/etc/cron.d/job", allowWrite, denyWrite, cwd)).toBe("prompt");
+    // /etc is in mandatory denyWrite, so it denies
+    expect(decideWritePolicy("/etc/cron.d/job", allowWrite, denyWrite, cwd)).toBe("deny");
+    // Writing outside workspace to non-system file requires prompt
+    expect(decideWritePolicy("/var/log/my-custom-app.log", allowWrite, denyWrite, cwd)).toBe("prompt");
     expect(decideWritePolicy("/home/user/.bashrc", allowWrite, denyWrite, cwd)).toBe("prompt");
   });
 });
