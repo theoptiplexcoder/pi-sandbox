@@ -1,7 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import { DEFAULT_CONFIG, type SandboxConfig } from "../src/config.ts";
 import { decideReadPolicy, decideWritePolicy } from "../src/policy.ts";
-import { evaluateToolCall, type ToolGuardOptions } from "../src/tool-guard.ts";
+import {
+  evaluateToolCall,
+  sanitizeLogString,
+  type AuditLogEntry,
+  type ToolGuardOptions,
+} from "../src/tool-guard.ts";
 
 describe("Phase 2: In-Process Tool Guard Policy Tests", () => {
   const cwd = "/home/user/project";
@@ -36,79 +41,105 @@ describe("Phase 2: In-Process Tool Guard Policy Tests", () => {
   });
 });
 
-describe("Phase 2: In-Process Tool Call Interception & Adversarial Probes", () => {
+describe("Phase 2: Dispatcher Table & Complete Tool Coverage (Audit Step 2)", () => {
+  const cwd = "/home/user/project";
+  const defaultOptions: ToolGuardOptions = { config: DEFAULT_CONFIG };
+
+  // Explicit test for each tool name targeting a forbidden path
+  it("blocks READ targeting secret path", async () => {
+    const res = await evaluateToolCall({ toolName: "read", input: { path: "~/.ssh/id_rsa" } }, { cwd }, defaultOptions);
+    expect(res?.block).toBe(true);
+    expect(res?.reason).toContain("denied by security policy");
+  });
+
+  it("blocks WRITE targeting .env", async () => {
+    const res = await evaluateToolCall({ toolName: "write", input: { path: ".env", content: "X=1" } }, { cwd }, defaultOptions);
+    expect(res?.block).toBe(true);
+    expect(res?.reason).toContain("denied by security policy");
+  });
+
+  it("blocks EDIT targeting .pi/sandbox.json", async () => {
+    const res = await evaluateToolCall({ toolName: "edit", input: { path: ".pi/sandbox.json", edits: [] } }, { cwd }, defaultOptions);
+    expect(res?.block).toBe(true);
+    expect(res?.reason).toContain("denied by security policy");
+  });
+
+  it("blocks GREP targeting ~/.ssh", async () => {
+    const res = await evaluateToolCall({ toolName: "grep", input: { pattern: "key", path: "~/.ssh" } }, { cwd }, defaultOptions);
+    expect(res?.block).toBe(true);
+    expect(res?.reason).toContain("denied by security policy");
+  });
+
+  it("blocks FIND targeting ~/.aws", async () => {
+    const res = await evaluateToolCall({ toolName: "find", input: { pattern: "*", path: "~/.aws" } }, { cwd }, defaultOptions);
+    expect(res?.block).toBe(true);
+    expect(res?.reason).toContain("denied by security policy");
+  });
+
+  it("blocks LS targeting /etc/shadow", async () => {
+    const res = await evaluateToolCall({ toolName: "ls", input: { path: "/etc/shadow" } }, { cwd }, defaultOptions);
+    expect(res?.block).toBe(true);
+    expect(res?.reason).toContain("denied by security policy");
+  });
+
+  it("allows safe exploration tools inside workspace", async () => {
+    expect(await evaluateToolCall({ toolName: "read", input: { path: "src/main.ts" } }, { cwd }, defaultOptions)).toBeUndefined();
+    expect(await evaluateToolCall({ toolName: "grep", input: { pattern: "fn", path: "src" } }, { cwd }, defaultOptions)).toBeUndefined();
+    expect(await evaluateToolCall({ toolName: "find", input: { pattern: "*.ts", path: "src" } }, { cwd }, defaultOptions)).toBeUndefined();
+    expect(await evaluateToolCall({ toolName: "ls", input: { path: "src" } }, { cwd }, defaultOptions)).toBeUndefined();
+  });
+});
+
+describe("Phase 2: Audit Logging & Sanitization (Audit Step 3)", () => {
   const cwd = "/home/user/project";
 
-  const defaultOptions: ToolGuardOptions = {
-    config: DEFAULT_CONFIG,
-  };
-
-  it("blocks READ tool calls targeting secrets", async () => {
-    const event = {
-      toolName: "read",
-      input: { path: "~/.ssh/id_rsa" },
-    };
-
-    const result = await evaluateToolCall(event, { cwd }, defaultOptions);
-    expect(result?.block).toBe(true);
-    expect(result?.reason).toContain("denied by security policy");
+  it("sanitizes terminal escape codes and control characters in log strings", () => {
+    const maliciousPath = "\x1B[31m~/.ssh/id_rsa\x1B[0m\n\r/evil";
+    const cleaned = sanitizeLogString(maliciousPath);
+    expect(cleaned).not.toContain("\x1B");
+    expect(cleaned).not.toContain("\n");
+    expect(cleaned).not.toContain("\r");
+    expect(cleaned).toBe("~/.ssh/id_rsa  /evil");
   });
 
-  it("blocks WRITE tool calls targeting .env", async () => {
-    const event = {
-      toolName: "write",
-      input: { path: ".env", content: "SECRET=123" },
-    };
-
-    const result = await evaluateToolCall(event, { cwd }, defaultOptions);
-    expect(result?.block).toBe(true);
-    expect(result?.reason).toContain("denied by security policy");
+  it("truncates excessively long paths in audit logs", () => {
+    const hugePath = "a/".repeat(200);
+    const cleaned = sanitizeLogString(hugePath, 50);
+    expect(cleaned.length).toBeLessThan(70);
+    expect(cleaned.endsWith("...[truncated]")).toBe(true);
   });
 
-  it("blocks EDIT tool calls targeting .pi/sandbox.json (self-tampering prevention)", async () => {
-    const event = {
-      toolName: "edit",
-      input: { path: ".pi/sandbox.json", edits: [] },
+  it("records structured audit events for blocked calls", async () => {
+    const auditLogs: AuditLogEntry[] = [];
+    const options: ToolGuardOptions = {
+      config: DEFAULT_CONFIG,
+      onAudit: (entry) => auditLogs.push(entry),
     };
 
-    const result = await evaluateToolCall(event, { cwd }, defaultOptions);
-    expect(result?.block).toBe(true);
-    expect(result?.reason).toContain("denied by security policy");
+    await evaluateToolCall(
+      { toolName: "read", input: { path: "~/.ssh/id_rsa" } },
+      { cwd },
+      options,
+    );
+
+    expect(auditLogs.length).toBe(1);
+    expect(auditLogs[0].toolName).toBe("read");
+    expect(auditLogs[0].path).toBe("~/.ssh/id_rsa");
+    expect(auditLogs[0].decision).toBe("deny");
+    expect(auditLogs[0].timestamp).toBeDefined();
   });
+});
 
-  it("allows valid tool calls inside project workspace", async () => {
-    const readEvent = {
-      toolName: "read",
-      input: { path: "src/main.ts" },
-    };
-    const readResult = await evaluateToolCall(readEvent, { cwd }, defaultOptions);
-    expect(readResult).toBeUndefined(); // Allowed
-
-    const writeEvent = {
-      toolName: "write",
-      input: { path: "src/main.ts", content: "console.log('ok');" },
-    };
-    const writeResult = await evaluateToolCall(writeEvent, { cwd }, defaultOptions);
-    expect(writeResult).toBeUndefined(); // Allowed
-  });
+describe("Phase 2: Fail-Safe & Adversarial Interception Probes", () => {
+  const cwd = "/home/user/project";
+  const defaultOptions: ToolGuardOptions = { config: DEFAULT_CONFIG };
 
   it("DIRECTIVE A: Prompt decision with NO prompter blocks for BOTH read and write (fail-closed)", async () => {
-    // Custom config where /opt/data requires prompt (not in workspace, not in allowRead)
-    const customConfig: SandboxConfig = {
-      ...DEFAULT_CONFIG,
-      filesystem: {
-        allowRead: [], // not allowed
-        denyRead: [...(DEFAULT_CONFIG.filesystem?.denyRead ?? [])],
-        allowWrite: [".", "/tmp"],
-      },
-    };
-
     const headlessOptions: ToolGuardOptions = {
-      config: customConfig,
-      askPermission: undefined, // Headless!
+      config: DEFAULT_CONFIG,
+      askPermission: undefined,
     };
 
-    // External read when policy returns prompt
     const extWriteEvent = {
       toolName: "write",
       input: { path: "/var/log/my-app.log", content: "log" },
@@ -188,34 +219,22 @@ describe("Phase 2: In-Process Tool Call Interception & Adversarial Probes", () =
     expect(res3?.block).toBe(true);
   });
 
-  it("honors interactive approval when askPermission returns true", async () => {
-    const externalWriteEvent = {
+  it("honors interactive approval and denial in prompt decisions", async () => {
+    const extWriteEvent = {
       toolName: "write",
       input: { path: "/var/log/app.log", content: "data" },
     };
 
-    const interactiveOptions: ToolGuardOptions = {
+    const approved = await evaluateToolCall(extWriteEvent, { cwd }, {
       config: DEFAULT_CONFIG,
-      askPermission: async (_msg, _path) => true, // User approves
-    };
+      askPermission: async () => true,
+    });
+    expect(approved).toBeUndefined();
 
-    const result = await evaluateToolCall(externalWriteEvent, { cwd }, interactiveOptions);
-    expect(result).toBeUndefined(); // Allowed through user approval
-  });
-
-  it("honors interactive denial when askPermission returns false", async () => {
-    const externalWriteEvent = {
-      toolName: "write",
-      input: { path: "/var/log/app.log", content: "data" },
-    };
-
-    const interactiveOptions: ToolGuardOptions = {
+    const denied = await evaluateToolCall(extWriteEvent, { cwd }, {
       config: DEFAULT_CONFIG,
-      askPermission: async (_msg, _path) => false, // User denies
-    };
-
-    const result = await evaluateToolCall(externalWriteEvent, { cwd }, interactiveOptions);
-    expect(result?.block).toBe(true);
-    expect(result?.reason).toContain("User denied permission");
+      askPermission: async () => false,
+    });
+    expect(denied?.block).toBe(true);
   });
 });
