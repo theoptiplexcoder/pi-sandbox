@@ -1,20 +1,28 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createBashTool } from "@earendil-works/pi-coding-agent";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createSandboxedBashOps } from "./src/bash-operations.ts";
 import { isBwrapAvailable } from "./src/bwrap.ts";
 import { loadConfig, type SandboxConfig } from "./src/config.ts";
+import { isSecretPath } from "./src/policy.ts";
 import { startProxyServer, type ProxyServerManager } from "./src/proxy/proxy-server.ts";
 import { registerToolGuard } from "./src/tool-guard.ts";
 import { promptPermission } from "./src/ui.ts";
 
 /**
- * Saves a granted permission permanently to project-local `.pi/sandbox.json`.
+ * Saves a granted permission atomically to project-local `.pi/sandbox.json`.
+ * Enforces security invariants: rejects attempts to persist protected secrets.
  */
 export function saveProjectGrant(cwd: string, type: "domain" | "writePath", value: string): void {
+  // Security Gate: Reject persisting mandatory secrets
+  if (type === "writePath" && isSecretPath(value, [], cwd)) {
+    throw new Error(`[Security Sandbox] Cannot save protected secret '${value}' to project configuration.`);
+  }
+
   const piDir = join(cwd, ".pi");
   const configPath = join(piDir, "sandbox.json");
+  const tempPath = join(piDir, `sandbox.json.tmp.${Date.now()}`);
 
   try {
     if (!existsSync(piDir)) {
@@ -46,7 +54,9 @@ export function saveProjectGrant(cwd: string, type: "domain" | "writePath", valu
       };
     }
 
-    writeFileSync(configPath, JSON.stringify(existing, null, 2) + "\n", "utf-8");
+    // Atomic write using temp file and renameSync
+    writeFileSync(tempPath, JSON.stringify(existing, null, 2) + "\n", "utf-8");
+    renameSync(tempPath, configPath);
   } catch (err) {
     console.error(`[claudelike-pisandbox] Warning: Failed to save grant to ${configPath}:`, err);
   }
@@ -58,7 +68,6 @@ export function saveProjectGrant(cwd: string, type: "domain" | "writePath", valu
 export default function activate(pi: ExtensionAPI) {
   let activeConfig: SandboxConfig = loadConfig();
   let proxyManager: ProxyServerManager | null = null;
-  let activeContext: ExtensionContext | null = null;
 
   // Session-granted allowances
   const sessionAllowedDomains = new Set<string>();
@@ -84,19 +93,18 @@ export default function activate(pi: ExtensionAPI) {
     };
   };
 
-  // 1. In-Process Tool Guard (Node.js direct tools: read, write, edit, grep, find, ls)
+  // 1. In-Process Tool Guard (Context is passed per-event, no global activeContext)
   registerToolGuard(pi, () => ({
     config: getEffectiveConfig(),
-    askPermission: async (message, path) => {
-      if (!activeContext) return false;
-      const decision = await promptPermission(activeContext, message, path);
+    askPermission: async (ctx, message, path) => {
+      const decision = await promptPermission(ctx, message, path);
       if (decision === "session") {
         sessionAllowedPaths.add(path);
         return true;
       }
       if (decision === "project") {
         sessionAllowedPaths.add(path);
-        saveProjectGrant(activeContext.cwd || process.cwd(), "writePath", path);
+        saveProjectGrant(ctx.cwd || process.cwd(), "writePath", path);
         return true;
       }
       return false;
@@ -116,7 +124,6 @@ export default function activate(pi: ExtensionAPI) {
     ...sandboxedBashTool,
     label: "bash (sandboxed)",
     async execute(id, params, signal, onUpdate, ctx) {
-      activeContext = ctx;
       if (!activeConfig.enabled) {
         const defaultBash = createBashTool(ctx.cwd);
         return defaultBash.execute(id, params, signal, onUpdate);
@@ -126,15 +133,13 @@ export default function activate(pi: ExtensionAPI) {
     },
   });
 
-  pi.on("user_bash", (_event, ctx) => {
-    activeContext = ctx;
+  pi.on("user_bash", () => {
     if (!activeConfig.enabled) return;
     return { operations: sandboxedBashOps };
   });
 
   // 3. Lifecycle hooks
   pi.on("session_start", async (_event, ctx) => {
-    activeContext = ctx;
     activeConfig = loadConfig(ctx.cwd);
 
     if (activeConfig.enabled === false) {
@@ -155,9 +160,8 @@ export default function activate(pi: ExtensionAPI) {
       proxyManager = await startProxyServer({
         getConfig: getEffectiveConfig,
         onUnknownDomain: async (domain) => {
-          if (!activeContext) return false;
           const decision = await promptPermission(
-            activeContext,
+            ctx,
             "Subprocess requested outbound network connection",
             domain,
           );
@@ -167,7 +171,7 @@ export default function activate(pi: ExtensionAPI) {
           }
           if (decision === "project") {
             sessionAllowedDomains.add(domain);
-            saveProjectGrant(activeContext.cwd || process.cwd(), "domain", domain);
+            saveProjectGrant(ctx.cwd || process.cwd(), "domain", domain);
             return true;
           }
           return false;

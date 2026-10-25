@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import activate, { saveProjectGrant } from "../index.ts";
+import { sweepStaleSocketDirs } from "../src/proxy/proxy-server.ts";
 import { promptPermission } from "../src/ui.ts";
 
 describe("Phase 5: UI & Interactive Permission Prompting", () => {
@@ -33,8 +34,31 @@ describe("Phase 5: UI & Interactive Permission Prompting", () => {
 
     expect(decision).toBe("abort");
     expect(capturedPrompt).not.toContain("\x1B");
-    expect(capturedPrompt).not.toContain("\nTarget: evil.com\x1B");
     expect(capturedPrompt).toContain("evil.com  /secret");
+  });
+
+  it("AUDIT FINDING 2: omits 'Allow and save to project' option for protected secrets", async () => {
+    let capturedOptions: string[] = [];
+    const mockCtx: any = {
+      hasUI: true,
+      cwd: "/home/user/project",
+      ui: {
+        select: async (_message: string, options: string[]) => {
+          capturedOptions = options;
+          return "Deny (Abort)";
+        },
+      },
+    };
+
+    // 1. Target is a secret path (.env)
+    await promptPermission(mockCtx, "Secret Access", ".env");
+    expect(capturedOptions).toContain("Allow for this session");
+    expect(capturedOptions).toContain("Deny (Abort)");
+    expect(capturedOptions).not.toContain("Allow and save to project (.pi/sandbox.json)");
+
+    // 2. Target is safe non-secret path (/var/log/my-app)
+    await promptPermission(mockCtx, "Directory Access", "/var/log/my-app");
+    expect(capturedOptions).toContain("Allow and save to project (.pi/sandbox.json)");
   });
 
   it("returns 'session' when operator approves for session", async () => {
@@ -42,7 +66,7 @@ describe("Phase 5: UI & Interactive Permission Prompting", () => {
       hasUI: true,
       ui: {
         select: async (_msg: string, options: string[]) => {
-          return options[0]; // "Allow for this session"
+          return options[0];
         },
       },
     };
@@ -56,7 +80,7 @@ describe("Phase 5: UI & Interactive Permission Prompting", () => {
       hasUI: true,
       ui: {
         select: async (_msg: string, options: string[]) => {
-          return options[1]; // "Allow and save to project (.pi/sandbox.json)"
+          return options[1];
         },
       },
     };
@@ -66,8 +90,8 @@ describe("Phase 5: UI & Interactive Permission Prompting", () => {
   });
 });
 
-describe("Phase 5: Project-Local Grant Persistence", () => {
-  it("persists domain and write path grants to .pi/sandbox.json cleanly", () => {
+describe("Phase 5: Project-Local Grant Persistence & Validation", () => {
+  it("persists domain and write path grants to .pi/sandbox.json atomically", () => {
     const testDir = join(tmpdir(), `pi-sandbox-grant-test-${Date.now()}`);
     mkdirSync(testDir, { recursive: true });
 
@@ -82,6 +106,46 @@ describe("Phase 5: Project-Local Grant Persistence", () => {
     expect(saved.filesystem?.allowWrite).toContain("/var/log/my-app");
 
     rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it("rejects persisting grants targeting protected secrets", () => {
+    const testDir = join(tmpdir(), `pi-sandbox-reject-secret-${Date.now()}`);
+    mkdirSync(testDir, { recursive: true });
+
+    expect(() => {
+      saveProjectGrant(testDir, "writePath", ".env");
+    }).toThrow("Cannot save protected secret");
+
+    expect(() => {
+      saveProjectGrant(testDir, "writePath", "~/.ssh/id_rsa");
+    }).toThrow("Cannot save protected secret");
+
+    rmSync(testDir, { recursive: true, force: true });
+  });
+});
+
+describe("Phase 5: Startup Socket Sweep & Dead Process Recovery", () => {
+  it("cleans up stale socket directories belonging to dead PIDs while preserving live PIDs", () => {
+    const testBaseDir = join(tmpdir(), `pi-sandbox-sweep-test-${Date.now()}`);
+    mkdirSync(testBaseDir, { recursive: true });
+
+    // 1. Directory with a dead PID (e.g. 9999999)
+    const deadDir = join(testBaseDir, "proxy-pid-9999999-12345678-abc");
+    mkdirSync(deadDir, { recursive: true });
+
+    // 2. Directory with the current live PID
+    const liveDir = join(testBaseDir, `proxy-pid-${process.pid}-12345678-xyz`);
+    mkdirSync(liveDir, { recursive: true });
+
+    // Run sweep
+    sweepStaleSocketDirs(testBaseDir);
+
+    // Dead PID dir should be removed
+    expect(existsSync(deadDir)).toBe(false);
+    // Current live PID dir must be preserved
+    expect(existsSync(liveDir)).toBe(true);
+
+    rmSync(testBaseDir, { recursive: true, force: true });
   });
 });
 
@@ -102,18 +166,14 @@ describe("Phase 5: Extension Lifecycle & Registration Integration", () => {
       },
     };
 
-    // Activate extension
     activate(mockPi);
 
-    // Verify bash tool replacement
     expect(registeredTools.length).toBe(1);
     expect(registeredTools[0].label).toContain("bash (sandboxed)");
 
-    // Verify registered commands
     expect(registeredCommands["sandbox"]).toBeDefined();
     expect(registeredCommands["sandbox-toggle"]).toBeDefined();
 
-    // Verify hooks registered
     expect(registeredHooks["tool_call"]).toBeDefined();
     expect(registeredHooks["user_bash"]).toBeDefined();
     expect(registeredHooks["session_start"]).toBeDefined();

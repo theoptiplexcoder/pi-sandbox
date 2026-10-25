@@ -12,10 +12,10 @@ export interface ToolGuardOptions {
    */
   config: SandboxConfig;
   /**
-   * Interactive permission prompt callback.
-   * If omitted or in non-interactive / headless mode, decisions requiring 'prompt' fail-closed to block.
+   * Context-aware interactive permission prompt callback.
+   * Directly receives the ExtensionContext from the tool_call event.
    */
-  askPermission?: (message: string, path: string) => Promise<boolean>;
+  askPermission?: (ctx: ExtensionContext, message: string, path: string) => Promise<boolean>;
   /**
    * Optional custom audit logger callback (for telemetry or testing).
    */
@@ -44,14 +44,11 @@ export interface ToolBlockResult {
 
 /**
  * Sanitizes and truncates attacker-controlled path strings before writing to logs.
- * Strips ASCII/ANSI escape codes, replaces control characters (like newlines)
- * and truncates to 200 characters to prevent log injection or terminal corruption.
  */
 export function sanitizeLogString(str: string, maxLength: number = 200): string {
-  // Strip ANSI escape sequences and non-printable control characters
   const clean = str
     .replace(/\x1B\[[0-9;]*[a-zA-Z]/g, "") // ANSI escape codes
-    .replace(/[\x00-\x1F\x7F-\x9F]/g, " ") // Control characters including \n, \r, \t, \0
+    .replace(/[\x00-\x1F\x7F-\x9F]/g, " ") // Control characters
     .trim();
 
   if (clean.length > maxLength) {
@@ -60,10 +57,6 @@ export function sanitizeLogString(str: string, maxLength: number = 200): string 
   return clean;
 }
 
-/**
- * Logs security audit events (blocks, prompts, and security exceptions).
- * Only logs blocks and prompts (never allowed routine operations) to avoid log noise.
- */
 function recordAudit(
   entry: AuditLogEntry,
   onAudit?: (entry: AuditLogEntry) => void,
@@ -71,12 +64,9 @@ function recordAudit(
   if (onAudit) {
     try {
       onAudit(entry);
-    } catch {
-      // Ignore consumer audit logger crashes
-    }
+    } catch {}
   }
 
-  // Always output structured security notice to stderr
   const safePath = sanitizeLogString(entry.path);
   const safeReason = sanitizeLogString(entry.reason);
   console.error(
@@ -84,25 +74,12 @@ function recordAudit(
   );
 }
 
-/**
- * Table definition for guarded file-system tools.
- * Each entry defines:
- * - getPath: extracts and validates the target path from the tool input.
- * - policy: the security decision function (decideReadPolicy or decideWritePolicy).
- * - rules: selects the relevant allow/deny rules from filesystem configuration.
- */
 interface GuardedToolSpec {
   policy: (path: string, allow: string[], deny: string[], cwd: string) => FilePolicyDecision;
   rules: (fs: FilesystemConfig) => { allow: string[]; deny: string[] };
   getPath: (input: unknown) => string | undefined;
 }
 
-/**
- * Guarded tools lookup table.
- * Covers all Pi built-in filesystem tools:
- * - Direct file tools: 'read', 'write', 'edit'
- * - Exploration tools: 'grep', 'find', 'ls'
- */
 const GUARDED_TOOLS: Record<string, GuardedToolSpec> = {
   read: {
     policy: decideReadPolicy,
@@ -136,10 +113,6 @@ const GUARDED_TOOLS: Record<string, GuardedToolSpec> = {
   },
 };
 
-/**
- * Validates and sanitizes an extracted path parameter.
- * Rejects non-strings, empty strings, and null-byte poison attacks.
- */
 function validatePathInput(rawPath: unknown): { valid: true; path: string } | { valid: false; reason: string } {
   if (typeof rawPath !== "string") {
     return {
@@ -166,13 +139,11 @@ function validatePathInput(rawPath: unknown): { valid: true; path: string } | { 
   return { valid: true, path: trimmed };
 }
 
-/**
- * Shared helper to resolve 'prompt' decisions fail-closed across all tool types.
- */
 async function resolvePrompt(
+  ctx: ExtensionContext,
   toolName: string,
   targetPath: string,
-  askPermission?: (message: string, path: string) => Promise<boolean>,
+  askPermission?: (ctx: ExtensionContext, message: string, path: string) => Promise<boolean>,
   onAudit?: (entry: AuditLogEntry) => void,
 ): Promise<ToolBlockResult | undefined> {
   const timestamp = new Date().toISOString();
@@ -185,6 +156,7 @@ async function resolvePrompt(
 
   try {
     const approved = await askPermission(
+      ctx,
       `Agent is requesting '${toolName}' access to path outside workspace: ${targetPath}`,
       targetPath,
     );
@@ -206,7 +178,6 @@ async function resolvePrompt(
     );
     return undefined; // Approved
   } catch (err: unknown) {
-    // Fail-Closed: If the UI prompt dialog throws or aborts, block the call
     const reason = `[Security Sandbox Error] Permission prompt threw an unexpected error: ${err instanceof Error ? err.message : String(err)}. Operation blocked.`;
     recordAudit({ timestamp, toolName, path: targetPath, decision: "error", reason }, onAudit);
     return { block: true, reason };
@@ -214,36 +185,27 @@ async function resolvePrompt(
 }
 
 /**
- * Evaluates an in-process tool call event and determines if it should be allowed or blocked.
- * This is the exact logic executed inside pi.on("tool_call").
- *
- * Security Model:
- * - Lookup Table Dispatcher: Eliminates code duplication across tools.
- * - Complete Built-in Coverage: Guards read, write, edit, grep, find, and ls.
- * - Fail-Closed: Any unhandled exception, missing prompt, or malformed input blocks the tool.
- * - Audit Logging: Logs all blocks and prompts with sanitized path strings.
+ * Evaluates an in-process tool call event with the explicit context from the caller.
  */
 export async function evaluateToolCall(
   event: unknown,
-  ctx: { cwd: string },
+  ctx: ExtensionContext | { cwd: string; hasUI?: boolean },
   options: ToolGuardOptions,
 ): Promise<ToolBlockResult | undefined> {
   try {
     const { config, askPermission, onAudit } = options;
 
-    // If sandbox is explicitly disabled by operator, bypass guard
     if (config.enabled === false) {
       return undefined;
     }
 
     const toolName = (event as any)?.toolName;
     if (typeof toolName !== "string") {
-      return undefined; // Not a recognized tool call format
+      return undefined;
     }
 
     const spec = GUARDED_TOOLS[toolName];
     if (!spec) {
-      // Tool not in guarded table (e.g. bash or custom tools, which are handled in Phase 3/4)
       return undefined;
     }
 
@@ -287,7 +249,7 @@ export async function evaluateToolCall(
     }
 
     if (decision === "prompt") {
-      return await resolvePrompt(toolName, targetPath, askPermission, onAudit);
+      return await resolvePrompt(ctx as ExtensionContext, toolName, targetPath, askPermission, onAudit);
     }
 
     return undefined; // Allowed
@@ -310,10 +272,10 @@ export async function evaluateToolCall(
 
 /**
  * Registers in-process interception on pi.on("tool_call") to secure
- * direct Node.js tools.
+ * direct Node.js tools. Context is passed directly into the evaluator.
  */
 export function registerToolGuard(pi: ExtensionAPI, getOptions: () => ToolGuardOptions) {
   pi.on("tool_call", async (event, ctx: ExtensionContext) => {
-    return evaluateToolCall(event, { cwd: ctx.cwd || process.cwd() }, getOptions());
+    return evaluateToolCall(event, ctx, getOptions());
   });
 }
