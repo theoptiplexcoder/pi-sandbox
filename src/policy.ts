@@ -4,8 +4,17 @@ import { expandTilde } from "./config.ts";
 
 /**
  * Resolves symlinks and normalizes paths using native realpath where possible.
- * If the file or parent does not exist yet (e.g. pending write), resolves existing
- * ancestor chain and appends remaining non-existent components to defeat path traversal.
+ *
+ * Security Considerations:
+ * - Direct string manipulation (e.g. `path.normalize`) fails to catch symlink escapes
+ *   where a symlink points to outside the workspace (e.g. `repo/link -> /etc/shadow`).
+ * - For files that do not exist yet (e.g. pending write operations), this function
+ *   traverses upward to locate the nearest existing ancestor, resolves its realpath,
+ *   and appends remaining non-existent components, defeating directory traversal (`../../`).
+ *
+ * @param filePath Path to resolve and canonicalize.
+ * @param baseCwd Working directory to resolve relative paths against.
+ * @returns Canonicalized absolute path string.
  */
 export function canonicalizePath(filePath: string, baseCwd: string = process.cwd()): string {
   const expanded = expandTilde(filePath);
@@ -36,10 +45,16 @@ export function canonicalizePath(filePath: string, baseCwd: string = process.cwd
 
 /**
  * Checks if a given file path matches any pattern in the list.
- * Supports:
- * - Direct paths / exact matches (e.g. "/etc/shadow", "~/.ssh")
- * - Directory prefixes (e.g. "~/.ssh" matches "~/.ssh/id_rsa")
- * - Glob wildcards (e.g. "*.pem", ".env*", "id_rsa*")
+ *
+ * Supports three matching tiers:
+ * 1. Filename glob check (e.g. "*.pem", ".env*", "id_rsa*") evaluated against basename.
+ * 2. Path-based glob check (e.g. "/var/log/*.log" or ".env.*") evaluated against canonical path.
+ * 3. Exact path or directory prefix check (e.g. "~/.ssh" matches "~/.ssh/id_rsa").
+ *
+ * @param filePath Target path to test.
+ * @param patterns Array of pattern strings.
+ * @param baseCwd Working directory for relative pattern resolution.
+ * @returns True if target path matches at least one pattern.
  */
 export function matchesPattern(
   filePath: string,
@@ -54,7 +69,7 @@ export function matchesPattern(
   for (const rawPattern of patterns) {
     if (!rawPattern) continue;
 
-    // 1. Filename glob check (e.g., "*.pem", ".env*", "id_rsa*")
+    // 1. Filename glob check (e.g. "*.pem", ".env*", "id_rsa*")
     if (rawPattern.includes("*") && !rawPattern.includes("/") && !rawPattern.includes("\\")) {
       const globRegex = new RegExp(
         "^" + rawPattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$",
@@ -65,7 +80,7 @@ export function matchesPattern(
       continue;
     }
 
-    // 2. Path-based glob check (e.g., "/var/log/*.log" or ".env.*")
+    // 2. Path-based glob check (e.g. "/var/log/*.log" or ".env.*")
     if (rawPattern.includes("*")) {
       const expandedPattern = expandTilde(rawPattern);
       const absPattern = isAbsolute(expandedPattern)
@@ -97,7 +112,7 @@ export function matchesPattern(
 }
 
 /**
- * High-risk secret patterns that should always be shielded.
+ * Built-in high-risk secret patterns that must be shielded across all environments.
  */
 export const DEFAULT_SECRET_PATTERNS = [
   "~/.ssh",
@@ -121,7 +136,12 @@ export const DEFAULT_SECRET_PATTERNS = [
 ];
 
 /**
- * Checks whether a path points to a sensitive host secret.
+ * Evaluates whether a path points to a sensitive host secret or credential store.
+ *
+ * @param filePath Path to evaluate.
+ * @param extraPatterns Optional additional secret patterns.
+ * @param baseCwd Working directory for relative pattern resolution.
+ * @returns True if path matches any secret pattern.
  */
 export function isSecretPath(
   filePath: string,
@@ -132,10 +152,28 @@ export function isSecretPath(
   return matchesPattern(filePath, allPatterns, baseCwd);
 }
 
+/**
+ * Decision states returned by policy checks.
+ * - "allow": Operation permitted without user interruption.
+ * - "deny": Operation blocked immediately (security violation).
+ * - "prompt": Operation requires explicit user approval via TUI.
+ */
 export type FilePolicyDecision = "allow" | "deny" | "prompt";
 
 /**
- * Decides whether a read operation should be allowed, denied, or prompted.
+ * Decides whether a file READ operation should be allowed, denied, or prompted.
+ *
+ * Rules:
+ * 1. Deny if in denyRead or matches isSecretPath.
+ * 2. Allow if in explicit allowRead.
+ * 3. Allow if inside working directory (cwd) or /tmp.
+ * 4. General system reads allowed unless matching denyRead.
+ *
+ * @param filePath Path being read.
+ * @param allowRead Custom read allowances.
+ * @param denyRead Forbidden read paths.
+ * @param baseCwd Workspace directory.
+ * @returns FilePolicyDecision
  */
 export function decideReadPolicy(
   filePath: string,
@@ -172,11 +210,22 @@ export function decideReadPolicy(
     return "allow";
   }
 
-  return "allow"; // Reads to general system utilities are permitted unless in denyRead
+  return "allow"; // Reads to general system binaries/libs are permitted unless in denyRead
 }
 
 /**
- * Decides whether a write operation should be allowed, denied, or prompted.
+ * Decides whether a file WRITE or EDIT operation should be allowed, denied, or prompted.
+ *
+ * Rules:
+ * 1. Deny if in denyWrite or matches isSecretPath (e.g. .env, *.key).
+ * 2. Allow if within allowWrite boundaries (default: ['.', '/tmp'] or custom paths).
+ * 3. Prompt if writing outside allowed boundaries (e.g. /etc/, ~/.bashrc).
+ *
+ * @param filePath Path being written/edited.
+ * @param allowWrite Allowed write boundaries.
+ * @param denyWrite Forbidden write targets.
+ * @param baseCwd Workspace directory.
+ * @returns FilePolicyDecision
  */
 export function decideWritePolicy(
   filePath: string,
