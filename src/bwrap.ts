@@ -94,8 +94,10 @@ export function resolveGitDirectory(workspaceDir: string): string | null {
  * Generates git protection mounts.
  * Ensures `.git/hooks` is pre-created on the host so an attacker cannot later `mkdir .git/hooks`
  * inside the sandbox to plant delayed execution hooks. Also mounts `.git/config` as read-only.
+ * If gitPush.enabled is true, .git/config is left writable so git can manage lock files/remotes,
+ * while .git/hooks remains permanently read-only.
  */
-export function buildGitProtectionMounts(workspaceDir: string): string[] {
+export function buildGitProtectionMounts(workspaceDir: string, allowGitConfigWrite = false): string[] {
   const mounts: string[] = [];
   const gitDir = resolveGitDirectory(workspaceDir);
   if (!gitDir) return mounts;
@@ -108,10 +110,12 @@ export function buildGitProtectionMounts(workspaceDir: string): string[] {
     }
     mounts.push("--ro-bind", hooksDir, hooksDir);
 
-    // 2. Protect git config if it exists
-    const configPath = join(gitDir, "config");
-    if (existsSync(configPath)) {
-      mounts.push("--ro-bind", configPath, configPath);
+    // 2. Protect git config if it exists unless explicitly allowed
+    if (!allowGitConfigWrite) {
+      const configPath = join(gitDir, "config");
+      if (existsSync(configPath)) {
+        mounts.push("--ro-bind", configPath, configPath);
+      }
     }
   } catch {
     // Ignore git creation errors
@@ -219,7 +223,8 @@ export function buildBwrapArgs(options: BwrapOptions): string[] {
   }
 
   // 9. Git Persistence & Execution Hook Protection (including worktree support)
-  const gitMounts = buildGitProtectionMounts(resolvedCwd);
+  const allowGitConfigWrite = config.gitPush?.enabled === true;
+  const gitMounts = buildGitProtectionMounts(resolvedCwd, allowGitConfigWrite);
   args.push(...gitMounts);
 
   // Remount read-only over other project hook directories if present

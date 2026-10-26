@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 import { buildBwrapArgs, isBwrapAvailable } from "./bwrap.ts";
 import type { SandboxConfig } from "./config.ts";
+import { evaluateGitPushPolicy, isGitPushCommand } from "./git-policy.ts";
 
 export interface SandboxedBashOptions {
   config: SandboxConfig;
@@ -30,6 +31,16 @@ export function createSandboxedBashOps(getOptions: () => SandboxedBashOptions): 
       }
 
       const { config, socketDir } = getOptions();
+
+      // Git push validation: Intercept git push commands and enforce branch protection
+      if (isGitPushCommand(command)) {
+        const policy = evaluateGitPushPolicy(command, cwd, config.gitPush);
+        if (!policy.allowed) {
+          const err = new Error(policy.reason ?? "[Security Sandbox Violation] git push blocked by policy.");
+          onData(Buffer.from(`${policy.reason}\n`));
+          return { exitCode: 1 };
+        }
+      }
 
       // If sandbox is explicitly disabled by operator, fall back to direct uncontained execution
       if (config.enabled === false) {

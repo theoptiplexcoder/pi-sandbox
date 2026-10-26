@@ -1,6 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import type { GitPushConfig } from "./git-policy.ts";
+
+export type { GitPushConfig } from "./git-policy.ts";
 
 /**
  * Configuration options for network egress isolation and domain filtering.
@@ -64,6 +67,10 @@ export interface SandboxConfig {
    * Filesystem access configuration.
    */
   filesystem?: FilesystemConfig;
+  /**
+   * Git push and branch protection configuration.
+   */
+  gitPush?: GitPushConfig;
 }
 
 /**
@@ -148,6 +155,11 @@ export const DEFAULT_CONFIG: SandboxConfig = {
     allowWrite: [".", "/tmp"],
     denyWrite: [...MANDATORY_INVARIANTS.denyWrite],
   },
+  gitPush: {
+    enabled: false,
+    protectedBranches: ["main", "master", "release/*", "prod*"],
+    allowBranches: ["*"],
+  },
 };
 
 /**
@@ -231,6 +243,17 @@ export function mergeGlobalConfig(
         globalOverrides.filesystem?.denyWrite,
       ]),
     },
+    gitPush: {
+      enabled:
+        globalOverrides.gitPush?.enabled !== undefined
+          ? globalOverrides.gitPush.enabled
+          : base.gitPush?.enabled ?? false,
+      protectedBranches: uniqueArray([
+        base.gitPush?.protectedBranches,
+        globalOverrides.gitPush?.protectedBranches,
+      ]),
+      allowBranches: globalOverrides.gitPush?.allowBranches ?? base.gitPush?.allowBranches ?? ["*"],
+    },
   };
 }
 
@@ -290,6 +313,15 @@ export function mergeProjectConfig(
       denyRead: effectiveDenyRead,
       allowWrite: trustedBase.filesystem?.allowWrite ?? [".", "/tmp"],
       denyWrite: effectiveDenyWrite,
+    },
+    gitPush: {
+      // Untrusted project can only disable or tighten gitPush (cannot enable if user disabled it)
+      enabled: trustedBase.gitPush?.enabled === true && projectOverrides.gitPush?.enabled !== false,
+      protectedBranches: uniqueArray([
+        trustedBase.gitPush?.protectedBranches,
+        projectOverrides.gitPush?.protectedBranches,
+      ]),
+      allowBranches: projectOverrides.gitPush?.allowBranches ?? trustedBase.gitPush?.allowBranches ?? ["*"],
     },
   };
 }
