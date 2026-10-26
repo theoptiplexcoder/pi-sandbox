@@ -1,0 +1,28 @@
+{
+  "name": "claudelike-pisandbox",
+  "version": "0.1.0",
+  "description": "Claude Code-style dual-layer OS and network sandboxing extension for pi",
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "sandbox",
+    "bubblewrap",
+    "security"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.85.1"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^22.13.4",
+    "typescript": "^5.7.3"
+  }
+}
