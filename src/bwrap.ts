@@ -232,6 +232,7 @@ export function buildBwrapArgs(options: BwrapOptions): string[] {
     join(resolvedCwd, ".pi"),
     join(resolvedCwd, ".vscode", "tasks.json"),
     join(resolvedCwd, ".envrc"),
+    "/etc/pi-sandbox",
   ];
 
   for (const p of sensitiveCwdPaths) {

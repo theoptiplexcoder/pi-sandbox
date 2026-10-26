@@ -97,6 +97,8 @@ export const MANDATORY_INVARIANTS: Readonly<{
     "~/.netrc",
     "/etc/shadow",
     "/etc/sudoers",
+    "/etc/pi-sandbox/**",
+    "/etc/pi-sandbox",
     "**/.pi/sandbox.json",
     "**/.pi/settings.json",
     "~/.pi/agent/sandbox.json",
@@ -114,6 +116,8 @@ export const MANDATORY_INVARIANTS: Readonly<{
     "id_rsa*",
     "id_ed25519*",
     "id_ecdsa*",
+    "/etc/pi-sandbox/**",
+    "/etc/pi-sandbox",
     "**/.pi/sandbox.json",
     "**/.pi/settings.json",
     "~/.pi/agent/sandbox.json",
@@ -329,18 +333,29 @@ export function mergeProjectConfig(
 /**
  * Loads and merges hierarchical sandbox configurations in priority order:
  * 1. Default built-in security config
- * 2. Global user config (~/.pi/agent/sandbox.json)
- * 3. Project-local config (<cwd>/.pi/sandbox.json) subjected to trust hierarchy filters.
+ * 2. System administrative config (/etc/pi-sandbox/sandbox.json) [Root/Admin owned]
+ * 3. Global user config (~/.pi/agent/sandbox.json)
+ * 4. Project-local config (<cwd>/.pi/sandbox.json) subjected to trust hierarchy filters.
  */
 export function loadConfig(
   cwd: string = process.cwd(),
-  customConfigPaths?: { global?: string; project?: string },
+  customConfigPaths?: { system?: string; global?: string; project?: string },
 ): SandboxConfig {
+  const systemPath = customConfigPaths?.system ?? "/etc/pi-sandbox/sandbox.json";
   const globalPath = customConfigPaths?.global ?? join(homedir(), ".pi", "agent", "sandbox.json");
   const projectPath = customConfigPaths?.project ?? join(cwd, ".pi", "sandbox.json");
 
+  let systemConfig: Partial<SandboxConfig> = {};
   let globalConfig: Partial<SandboxConfig> = {};
   let projectConfig: Partial<SandboxConfig> = {};
+
+  if (existsSync(systemPath)) {
+    try {
+      systemConfig = JSON.parse(readFileSync(systemPath, "utf-8"));
+    } catch (err) {
+      console.error(`[claudelike-pisandbox] Warning: Failed to parse system config at ${systemPath}:`, err);
+    }
+  }
 
   if (existsSync(globalPath)) {
     try {
@@ -358,6 +373,8 @@ export function loadConfig(
     }
   }
 
-  const trusted = mergeGlobalConfig(DEFAULT_CONFIG, globalConfig);
+  // System config acts as baseline override over defaults, followed by user and project
+  const baseWithSystem = mergeGlobalConfig(DEFAULT_CONFIG, systemConfig);
+  const trusted = mergeGlobalConfig(baseWithSystem, globalConfig);
   return mergeProjectConfig(trusted, projectConfig);
 }
