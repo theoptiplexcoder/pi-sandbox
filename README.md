@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # claudelike-pisandbox
 
 A dual-layer security sandboxing extension for the [pi coding agent harness](https://pi.dev/), inspired by Anthropic's Claude Code sandboxing architecture.
@@ -98,3 +99,7 @@ Run the comprehensive unit, adversarial, and functional container test suite:
 bun test
 bun run typecheck
 ```
+=======
+# pi-sandbox
+this is a pi sandbox that is built for pi coding harnesses. Uses bubblewrap for filesystem guardrails and a proxy server for network guardrails with read &amp; write permissions upto files granularity level 
+>>>>>>> origin/main
