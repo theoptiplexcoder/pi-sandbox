@@ -43,6 +43,17 @@ export interface ToolBlockResult {
 }
 
 /**
+ * Ensures any blocked message consistently ends with " [blocked by Sandbox]".
+ */
+export function formatBlockedReason(reason: string): string {
+  const suffix = " [blocked by Sandbox]";
+  if (reason.endsWith(suffix)) {
+    return reason;
+  }
+  return `${reason}${suffix}`;
+}
+
+/**
  * Sanitizes and truncates attacker-controlled path strings before writing to logs.
  */
 export function sanitizeLogString(str: string, maxLength: number = 200): string {
@@ -149,7 +160,9 @@ async function resolvePrompt(
   const timestamp = new Date().toISOString();
 
   if (!askPermission) {
-    const reason = `[Security Sandbox] Operation '${toolName}' on path '${targetPath}' outside allowed boundaries requires user approval, but no UI prompter is available.`;
+    const reason = formatBlockedReason(
+      `[Security Sandbox] Operation '${toolName}' on path '${targetPath}' outside allowed boundaries requires user approval, but no UI prompter is available.`,
+    );
     recordAudit({ timestamp, toolName, path: targetPath, decision: "prompt_blocked", reason }, onAudit);
     return { block: true, reason };
   }
@@ -161,7 +174,9 @@ async function resolvePrompt(
       targetPath,
     );
     if (!approved) {
-      const reason = `[Security Sandbox] User denied permission for '${toolName}' on '${targetPath}'.`;
+      const reason = formatBlockedReason(
+        `[Security Sandbox] User denied permission for '${toolName}' on '${targetPath}'.`,
+      );
       recordAudit({ timestamp, toolName, path: targetPath, decision: "prompt_blocked", reason }, onAudit);
       return { block: true, reason };
     }
@@ -178,7 +193,9 @@ async function resolvePrompt(
     );
     return undefined; // Approved
   } catch (err: unknown) {
-    const reason = `[Security Sandbox Error] Permission prompt threw an unexpected error: ${err instanceof Error ? err.message : String(err)}. Operation blocked.`;
+    const reason = formatBlockedReason(
+      `[Security Sandbox Error] Permission prompt threw an unexpected error: ${err instanceof Error ? err.message : String(err)}. Operation blocked.`,
+    );
     recordAudit({ timestamp, toolName, path: targetPath, decision: "error", reason }, onAudit);
     return { block: true, reason };
   }
@@ -212,7 +229,7 @@ export async function evaluateToolCall(
     const rawPath = spec.getPath((event as any).input);
     const pathValidation = validatePathInput(rawPath);
     if (!pathValidation.valid) {
-      const reason = `[Security Sandbox] ${pathValidation.reason}`;
+      const reason = formatBlockedReason(`[Security Sandbox] ${pathValidation.reason}`);
       recordAudit(
         {
           timestamp: new Date().toISOString(),
@@ -234,7 +251,9 @@ export async function evaluateToolCall(
     const decision = spec.policy(targetPath, allow, deny, baseCwd);
 
     if (decision === "deny") {
-      const reason = `[Security Sandbox Violation] Operation '${toolName}' on '${targetPath}' is denied by security policy.`;
+      const reason = formatBlockedReason(
+        `[Security Sandbox Violation] Operation '${toolName}' on '${targetPath}' is denied by security policy.`,
+      );
       recordAudit(
         {
           timestamp: new Date().toISOString(),
@@ -255,7 +274,9 @@ export async function evaluateToolCall(
     return undefined; // Allowed
   } catch (error: any) {
     const timestamp = new Date().toISOString();
-    const reason = `[Security Sandbox Error] Failed to evaluate security policy safely: ${error?.message || String(error)}. Operation blocked.`;
+    const reason = formatBlockedReason(
+      `[Security Sandbox Error] Failed to evaluate security policy safely: ${error?.message || String(error)}. Operation blocked.`,
+    );
     recordAudit(
       {
         timestamp,

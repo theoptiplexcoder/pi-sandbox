@@ -152,7 +152,7 @@ export function evaluateGitPushPolicy(
   if (gitPushConfig?.enabled !== true) {
     return {
       allowed: false,
-      reason: "[Security Sandbox] 'git push' is disabled in sandbox policy.",
+      reason: "[Security Sandbox] 'git push' is disabled in sandbox policy. [blocked by Sandbox]",
     };
   }
 
@@ -163,7 +163,7 @@ export function evaluateGitPushPolicy(
   if (targetBranches.length === 0) {
     return {
       allowed: false,
-      reason: "[Security Sandbox] Cannot determine target branch for 'git push'. Direct push blocked for safety.",
+      reason: "[Security Sandbox] Cannot determine target branch for 'git push'. Direct push blocked for safety. [blocked by Sandbox]",
     };
   }
 
@@ -172,7 +172,7 @@ export function evaluateGitPushPolicy(
     if (matchesBranchPattern(branch, protectedBranches)) {
       return {
         allowed: false,
-        reason: `[Security Sandbox Violation] Pushing to protected branch '${branch}' is forbidden by sandbox policy. Only non-main branches are permitted.`,
+        reason: `[Security Sandbox Violation] Pushing to protected branch '${branch}' is forbidden by sandbox policy. Only non-main branches are permitted. [blocked by Sandbox]`,
       };
     }
 
@@ -180,7 +180,7 @@ export function evaluateGitPushPolicy(
     if (!matchesBranchPattern(branch, allowBranches)) {
       return {
         allowed: false,
-        reason: `[Security Sandbox Violation] Target branch '${branch}' is not in allowedBranches list.`,
+        reason: `[Security Sandbox Violation] Target branch '${branch}' is not in allowedBranches list. [blocked by Sandbox]`,
       };
     }
   }

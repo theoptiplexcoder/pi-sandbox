@@ -178,8 +178,9 @@ export function createHttpProxy(options: HttpProxyOptions): http.Server {
 
       // 2. Direct IP literal check
       if (net.isIP(hostname) && isIpBlocked(hostname, allowLoopback)) {
+        const reason = `[claudelike-pisandbox] Blocked connection to private/reserved IP: ${hostname} [blocked by Sandbox]`;
         res.writeHead(403, { "Content-Type": "text/plain" });
-        res.end(`[claudelike-pisandbox] Blocked connection to private/reserved IP: ${hostname}`);
+        res.end(reason);
         return;
       }
 
@@ -204,7 +205,7 @@ export function createHttpProxy(options: HttpProxyOptions): http.Server {
             if (approved) {
               doForward();
             } else {
-              const reason = `[claudelike-pisandbox] Blocked connection to unapproved domain: ${hostname}`;
+              const reason = `[claudelike-pisandbox] Blocked connection to unapproved domain: ${hostname} [blocked by Sandbox]`;
               options.onBlocked?.(hostname, port, reason);
               res.writeHead(403, { "Content-Type": "text/plain" });
               res.end(reason);
@@ -215,7 +216,7 @@ export function createHttpProxy(options: HttpProxyOptions): http.Server {
             res.end(`Internal proxy error: ${String(err)}`);
           });
       } else {
-        const reason = `[claudelike-pisandbox] Blocked connection to unapproved domain: ${hostname}`;
+        const reason = `[claudelike-pisandbox] Blocked connection to unapproved domain: ${hostname} [blocked by Sandbox]`;
         options.onBlocked?.(hostname, port, reason);
         res.writeHead(403, { "Content-Type": "text/plain" });
         res.end(reason);
@@ -239,21 +240,21 @@ export function createHttpProxy(options: HttpProxyOptions): http.Server {
 
     // 1. Port restriction check
     if (!isPermittedPort(port, allowLoopback)) {
-      clientSocket.write("HTTP/1.1 403 Forbidden\r\n\r\nPort not permitted for egress.\r\n");
+      clientSocket.write("HTTP/1.1 403 Forbidden\r\n\r\nPort not permitted for egress. [blocked by Sandbox]\r\n");
       clientSocket.destroy();
       return;
     }
 
     // 2. Direct IP literal check
     if (net.isIP(host) && isIpBlocked(host, allowLoopback)) {
-      clientSocket.write("HTTP/1.1 403 Forbidden\r\n\r\nBlocked destination IP.\r\n");
+      clientSocket.write("HTTP/1.1 403 Forbidden\r\n\r\nBlocked destination IP. [blocked by Sandbox]\r\n");
       clientSocket.destroy();
       return;
     }
 
     const checkAndTunnel = (approved: boolean) => {
       if (!approved) {
-        const reason = `[claudelike-pisandbox] Blocked connection to unapproved domain: ${host}`;
+        const reason = `[claudelike-pisandbox] Blocked connection to unapproved domain: ${host} [blocked by Sandbox]`;
         options.onBlocked?.(host, port, reason);
         clientSocket.write("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n\r\n" + reason);
         clientSocket.destroy();
