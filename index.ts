@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createBashTool } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { createSandboxedBashOps } from "./src/bash-operations.ts";
 import { isBwrapAvailable } from "./src/bwrap.ts";
@@ -9,6 +10,52 @@ import { isSecretPath } from "./src/policy.ts";
 import { startProxyServer, type ProxyServerManager } from "./src/proxy/proxy-server.ts";
 import { registerToolGuard } from "./src/tool-guard.ts";
 import { promptPermission } from "./src/ui.ts";
+
+/**
+ * Saves a granted permission atomically to global user configuration `~/.pi/agent/sandbox.json`.
+ * Enforces security invariants: rejects attempts to persist protected secrets.
+ */
+export function saveGlobalGrant(type: "domain" | "writePath", value: string): void {
+  const globalDir = join(homedir(), ".pi", "agent");
+  const configPath = join(globalDir, "sandbox.json");
+  const tempPath = join(globalDir, `sandbox.json.tmp.${Date.now()}`);
+
+  try {
+    if (!existsSync(globalDir)) {
+      mkdirSync(globalDir, { recursive: true });
+    }
+
+    let existing: Partial<SandboxConfig> = {};
+    if (existsSync(configPath)) {
+      try {
+        existing = JSON.parse(readFileSync(configPath, "utf-8"));
+      } catch {
+        existing = {};
+      }
+    }
+
+    if (type === "domain") {
+      const allowed = new Set(existing.network?.allowedDomains ?? []);
+      allowed.add(value);
+      existing.network = {
+        ...existing.network,
+        allowedDomains: Array.from(allowed),
+      };
+    } else if (type === "writePath") {
+      const allowed = new Set(existing.filesystem?.allowWrite ?? []);
+      allowed.add(value);
+      existing.filesystem = {
+        ...existing.filesystem,
+        allowWrite: Array.from(allowed),
+      };
+    }
+
+    writeFileSync(tempPath, JSON.stringify(existing, null, 2) + "\n", "utf-8");
+    renameSync(tempPath, configPath);
+  } catch (err) {
+    console.error(`[claudelike-pisandbox] Warning: Failed to save global grant to ${configPath}:`, err);
+  }
+}
 
 /**
  * Saves a granted permission atomically to project-local `.pi/sandbox.json`.
@@ -98,13 +145,20 @@ export default function activate(pi: ExtensionAPI) {
     config: getEffectiveConfig(),
     askPermission: async (ctx, message, path) => {
       const decision = await promptPermission(ctx, message, path);
-      if (decision === "session") {
+      if (decision === "always") {
         sessionAllowedPaths.add(path);
+        saveGlobalGrant("writePath", path);
+        activeConfig = loadConfig(ctx.cwd);
         return true;
       }
       if (decision === "project") {
         sessionAllowedPaths.add(path);
         saveProjectGrant(ctx.cwd || process.cwd(), "writePath", path);
+        activeConfig = loadConfig(ctx.cwd);
+        return true;
+      }
+      if (decision === "session") {
+        sessionAllowedPaths.add(path);
         return true;
       }
       return false;
@@ -165,13 +219,20 @@ export default function activate(pi: ExtensionAPI) {
             "Subprocess requested outbound network connection",
             domain,
           );
-          if (decision === "session") {
+          if (decision === "always") {
             sessionAllowedDomains.add(domain);
+            saveGlobalGrant("domain", domain);
+            activeConfig = loadConfig(ctx.cwd);
             return true;
           }
           if (decision === "project") {
             sessionAllowedDomains.add(domain);
             saveProjectGrant(ctx.cwd || process.cwd(), "domain", domain);
+            activeConfig = loadConfig(ctx.cwd);
+            return true;
+          }
+          if (decision === "session") {
+            sessionAllowedDomains.add(domain);
             return true;
           }
           return false;

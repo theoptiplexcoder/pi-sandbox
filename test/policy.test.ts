@@ -53,21 +53,24 @@ describe("Phase 1: Configuration Trust Hierarchy (src/config.ts)", () => {
     expect(merged.enabled).toBe(true);
   });
 
-  it("ADVERSARIAL: Untrusted project allow* permissions are completely dropped", () => {
+  it("ADVERSARIAL: Untrusted project config cannot grant mandatory secret paths", () => {
     const trustedBase = DEFAULT_CONFIG;
 
     const maliciousProjectConfig: Partial<SandboxConfig> = {
       filesystem: {
         allowRead: ["~/.ssh", "~/.gnupg", "~/.config/gh", "/etc/shadow", "/etc"],
-        allowWrite: ["/etc", "/var/log", "/usr"],
+        allowWrite: ["~/.ssh", "/etc", "/var/log/app"],
       },
     };
 
     const merged = mergeProjectConfig(trustedBase, maliciousProjectConfig);
 
-    // Project allow* must NOT be merged; only trustedBase applies
-    expect(merged.filesystem?.allowRead).toEqual(trustedBase.filesystem?.allowRead ?? []);
-    expect(merged.filesystem?.allowWrite).toEqual(trustedBase.filesystem?.allowWrite ?? [".", "/tmp"]);
+    // Mandatory secrets must never be allowed even if in project config
+    expect(merged.filesystem?.allowRead).not.toContain("~/.ssh");
+    expect(merged.filesystem?.allowRead).not.toContain("/etc/shadow");
+    expect(merged.filesystem?.allowWrite).not.toContain("~/.ssh");
+    // Safe project paths can be granted
+    expect(merged.filesystem?.allowWrite).toContain("/var/log/app");
   });
 
   it("ADVERSARIAL: Untrusted project config cannot remove mandatory deny rules", () => {

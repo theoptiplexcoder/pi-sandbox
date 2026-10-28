@@ -4,8 +4,19 @@ import { sanitizeLogString } from "./tool-guard.ts";
 
 /**
  * Result options returned by the interactive permission prompt.
+ * 1. "always": Save globally / default config (changes top config / ~/.pi/agent/sandbox.json)
+ * 2. "project": Save to project level policy (.pi/sandbox.json)
+ * 3. "session": Allow for now / run once in this session
+ * 4. "abort": Deny and abort the operation
  */
-export type PromptDecision = "abort" | "session" | "project";
+export type PromptDecision = "always" | "project" | "session" | "abort";
+
+export const PROMPT_OPTIONS = {
+  ALWAYS: "1. Always yes (save to global configuration)",
+  PROJECT: "2. Only this time (save to project .pi/sandbox.json)",
+  SESSION: "3. Only for now (allow to run once in this session)",
+  DENY: "4. Deny (Abort)",
+} as const;
 
 /**
  * Prompts the operator for security permissions when an unlisted domain or external path is accessed.
@@ -39,24 +50,27 @@ export async function promptPermission(
   // Check if target touches mandatory secret paths
   const isProtectedSecret = isSecretPath(target, [], ctx.cwd || process.cwd());
 
-  const options = ["Allow for this session"];
+  const options: string[] = [];
 
-  // Only offer permanent project-level saving if it's NOT a protected mandatory secret
+  // Permanent grants are disabled if target is a protected mandatory secret (e.g. ~/.ssh, .env)
   if (!isProtectedSecret) {
-    options.push("Allow and save to project (.pi/sandbox.json)");
+    options.push(PROMPT_OPTIONS.ALWAYS);
+    options.push(PROMPT_OPTIONS.PROJECT);
   }
 
-  options.push("Deny (Abort)");
+  options.push(PROMPT_OPTIONS.SESSION);
+  options.push(PROMPT_OPTIONS.DENY);
 
   try {
     const notice = isProtectedSecret
       ? `🔒 [Security Alert - Protected Secret] ${safeTitle}\nTarget: ${safeTarget}\n(Note: Permanent grants are disabled for protected secrets)`
-      : `🔒 [Security Sandbox Alert] ${safeTitle}\nTarget: ${safeTarget}`;
+      : `🔒 [Security Sandbox Alert] ${safeTitle}\nTarget: ${safeTarget}\nChoose an access policy option:`;
 
     const choice = await ctx.ui.select(notice, options);
 
-    if (choice === options[0]) return "session";
-    if (choice === "Allow and save to project (.pi/sandbox.json)") return "project";
+    if (choice === PROMPT_OPTIONS.ALWAYS) return "always";
+    if (choice === PROMPT_OPTIONS.PROJECT) return "project";
+    if (choice === PROMPT_OPTIONS.SESSION) return "session";
     return "abort";
   } catch {
     // Fail closed if dialog was cancelled, aborted, or threw an error

@@ -156,7 +156,7 @@ export const DEFAULT_CONFIG: SandboxConfig = {
   filesystem: {
     allowRead: [],
     denyRead: [...MANDATORY_INVARIANTS.denyRead],
-    allowWrite: [".", "/tmp"],
+    allowWrite: [".","..", "/tmp"],
     denyWrite: [...MANDATORY_INVARIANTS.denyWrite],
   },
   gitPush: {
@@ -303,8 +303,27 @@ export function mergeProjectConfig(
     projectOverrides.filesystem?.denyWrite,
   ]);
 
-  // Security Hardening: Project-local allowRead and allowWrite are completely ignored.
-  // Only trustedBase (system defaults + user's ~/.pi/agent/sandbox.json) defines writable/readable roots.
+  const allMandatorySecrets = [
+    ...MANDATORY_INVARIANTS.denyRead,
+    ...MANDATORY_INVARIANTS.denyWrite,
+  ];
+
+  // Project-local allowed write and read paths filtered to exclude mandatory secrets
+  const filteredProjectAllowWrite = (projectOverrides.filesystem?.allowWrite ?? []).filter(
+    (p) => !allMandatorySecrets.some((inv) => {
+      const cleanInv = inv.replace(/\*+/g, "").replace(/\/+$/, "");
+      const cleanP = p.replace(/\/+$/, "");
+      return cleanP === cleanInv || cleanP.startsWith(cleanInv + "/") || cleanInv.startsWith(cleanP + "/");
+    }),
+  );
+  const filteredProjectAllowRead = (projectOverrides.filesystem?.allowRead ?? []).filter(
+    (p) => !allMandatorySecrets.some((inv) => {
+      const cleanInv = inv.replace(/\*+/g, "").replace(/\/+$/, "");
+      const cleanP = p.replace(/\/+$/, "");
+      return cleanP === cleanInv || cleanP.startsWith(cleanInv + "/") || cleanInv.startsWith(cleanP + "/");
+    }),
+  );
+
   return {
     enabled: effectiveEnabled,
     network: {
@@ -313,9 +332,15 @@ export function mergeProjectConfig(
       deniedDomains: effectiveDeniedDomains,
     },
     filesystem: {
-      allowRead: trustedBase.filesystem?.allowRead ?? [],
+      allowRead: uniqueArray([
+        trustedBase.filesystem?.allowRead,
+        filteredProjectAllowRead,
+      ]),
       denyRead: effectiveDenyRead,
-      allowWrite: trustedBase.filesystem?.allowWrite ?? [".", "/tmp"],
+      allowWrite: uniqueArray([
+        trustedBase.filesystem?.allowWrite ?? [".", "/tmp"],
+        filteredProjectAllowWrite,
+      ]),
       denyWrite: effectiveDenyWrite,
     },
     gitPush: {

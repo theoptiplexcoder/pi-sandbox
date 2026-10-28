@@ -52,27 +52,29 @@ describe("Phase 5: UI & Interactive Permission Prompting", () => {
 
     // 1. Target is a secret path (.env)
     await promptPermission(mockCtx, "Secret Access", ".env");
-    expect(capturedOptions).toContain("Allow for this session");
-    expect(capturedOptions).toContain("Deny (Abort)");
-    expect(capturedOptions).not.toContain("Allow and save to project (.pi/sandbox.json)");
+    expect(capturedOptions).toContain("3. Only for now (allow to run once in this session)");
+    expect(capturedOptions).toContain("4. Deny (Abort)");
+    expect(capturedOptions).not.toContain("2. Only this time (save to project .pi/sandbox.json)");
+    expect(capturedOptions).not.toContain("1. Always yes (save to global configuration)");
 
     // 2. Target is safe non-secret path (/var/log/my-app)
     await promptPermission(mockCtx, "Directory Access", "/var/log/my-app");
-    expect(capturedOptions).toContain("Allow and save to project (.pi/sandbox.json)");
+    expect(capturedOptions).toContain("1. Always yes (save to global configuration)");
+    expect(capturedOptions).toContain("2. Only this time (save to project .pi/sandbox.json)");
   });
 
-  it("returns 'session' when operator approves for session", async () => {
+  it("returns 'always' when operator chooses always yes", async () => {
     const mockCtx: any = {
       hasUI: true,
       ui: {
         select: async (_msg: string, options: string[]) => {
-          return options[0];
+          return options[0]; // "1. Always yes..."
         },
       },
     };
 
     const decision = await promptPermission(mockCtx, "Write Request", "/var/log/my-app");
-    expect(decision).toBe("session");
+    expect(decision).toBe("always");
   });
 
   it("returns 'project' when operator approves and saves to project", async () => {
@@ -80,13 +82,27 @@ describe("Phase 5: UI & Interactive Permission Prompting", () => {
       hasUI: true,
       ui: {
         select: async (_msg: string, options: string[]) => {
-          return options[1];
+          return options[1]; // "2. Only this time..."
         },
       },
     };
 
     const decision = await promptPermission(mockCtx, "Network Request", "api.stripe.com");
     expect(decision).toBe("project");
+  });
+
+  it("returns 'session' when operator approves for session only", async () => {
+    const mockCtx: any = {
+      hasUI: true,
+      ui: {
+        select: async (_msg: string, options: string[]) => {
+          return options[2]; // "3. Only for now..."
+        },
+      },
+    };
+
+    const decision = await promptPermission(mockCtx, "Write Request", "/var/log/my-app");
+    expect(decision).toBe("session");
   });
 });
 
